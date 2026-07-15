@@ -12,6 +12,12 @@ BAR_MARGIN_PX = 12
 BAR_HEIGHT_PX = 10
 BAR_TOP_OFFSET_PX = 32
 
+BAR_BG_COLOR = QColor(225, 225, 228)
+RANGE_HIGHLIGHT_COLOR = QColor(22, 163, 74, 150)
+START_HANDLE_COLOR = QColor(21, 128, 61)
+END_HANDLE_COLOR = QColor(200, 0, 0)
+POSITION_LINE_COLOR = QColor(37, 99, 235)
+
 
 def format_time(ms: int) -> str:
     total_seconds = max(ms, 0) // 1000
@@ -76,6 +82,18 @@ class CustomTimeline(QWidget):
         ms = max(ms, self._start_ms + MIN_GAP_MS)
         return min(ms, self._duration_ms)
 
+    def _clamp_start_for_drag(self, ms: int) -> int:
+        """ドラッグ操作専用。Startは現在地(position_ms)より後ろには
+        動かせない（現在見ている位置がStart/Endの範囲外にならないように
+        する）。set_start()経由のプログラム的な設定（リセット処理や
+        テスト用セットアップ）はこの制約の対象外とする。"""
+        return min(self._clamp_start(ms), self._position_ms)
+
+    def _clamp_end_for_drag(self, ms: int) -> int:
+        """ドラッグ操作専用。Endは現在地(position_ms)より前には
+        動かせない。"""
+        return max(self._clamp_end(ms), self._position_ms)
+
     def _bar_rect(self) -> QRect:
         return QRect(
             BAR_MARGIN_PX,
@@ -104,21 +122,24 @@ class CustomTimeline(QWidget):
         painter = QPainter(self)
         rect = self._bar_rect()
 
-        painter.fillRect(rect, QColor(200, 200, 200))
+        painter.fillRect(rect, BAR_BG_COLOR)
 
         start_x = self._ms_to_x(self._start_ms)
         end_x = self._ms_to_x(self._end_ms)
         highlight = QRect(
             int(start_x), rect.top(), max(int(end_x - start_x), 0), rect.height()
         )
-        painter.fillRect(highlight, QColor(100, 150, 255))
+        painter.fillRect(highlight, RANGE_HIGHLIGHT_COLOR)
 
         pos_x = self._ms_to_x(self._position_ms)
-        painter.setPen(QPen(QColor(220, 0, 0), 2))
+        painter.setPen(QPen(POSITION_LINE_COLOR, 2))
         painter.drawLine(int(pos_x), rect.top() - 6, int(pos_x), rect.bottom() + 6)
 
-        self._draw_handle(painter, start_x, rect.top(), QColor(0, 160, 0))
-        self._draw_handle(painter, end_x, rect.top(), QColor(200, 0, 0))
+        self._draw_handle(painter, start_x, rect.top(), START_HANDLE_COLOR)
+        self._draw_handle(painter, end_x, rect.top(), END_HANDLE_COLOR)
+        self._draw_handle(
+            painter, pos_x, rect.bottom(), POSITION_LINE_COLOR, flip=True
+        )
 
         painter.setPen(QPen(QColor(0, 0, 0)))
         painter.drawText(rect.left(), rect.bottom() + 24, format_time(self._position_ms))
@@ -127,13 +148,23 @@ class CustomTimeline(QWidget):
         painter.drawText(rect.right() - 70, rect.top() - 8, end_label)
 
     def _draw_handle(
-        self, painter: QPainter, x: float, top_y: int, color: QColor
+        self,
+        painter: QPainter,
+        x: float,
+        y: int,
+        color: QColor,
+        flip: bool = False,
     ) -> None:
+        """Start/Endハンドル用の上向き三角（バー上端のyから上に向かって
+        描画）。flip=Trueの場合は現在地マーカー用に上下反転させ、
+        バー下端のyから下に向かって描画する（上部の三角のミラー
+        イメージにする）。"""
         size = 7
+        edge_y = y + size if flip else y - size
         points = [
-            QPointF(x - size, top_y - size),
-            QPointF(x + size, top_y - size),
-            QPointF(x, top_y),
+            QPointF(x - size, edge_y),
+            QPointF(x + size, edge_y),
+            QPointF(x, y),
         ]
         painter.setBrush(QBrush(color))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -141,19 +172,28 @@ class CustomTimeline(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         x = event.position().x()
+        y = event.position().y()
+        rect = self._bar_rect()
         start_x = self._ms_to_x(self._start_ms)
         end_x = self._ms_to_x(self._end_ms)
 
-        if abs(x - start_x) <= HANDLE_HIT_RADIUS_PX:
-            self._dragging = "start"
-            return
-        if abs(x - end_x) <= HANDLE_HIT_RADIUS_PX:
-            self._dragging = "end"
-            return
+        # Start/Endハンドルは、バー上端より上（上部三角マークの領域）を
+        # クリックした場合のみ反応させる。この判定が無いと、バー本体や
+        # 下部の現在地三角マーク（2026-07-15追加）をクリックした際にも
+        # X座標がStart/Endに近ければ誤って反応してしまう
+        # （現在地をドラッグしたつもりがStart/Endが動いてしまう不具合）。
+        if y <= rect.top():
+            if abs(x - start_x) <= HANDLE_HIT_RADIUS_PX:
+                self._dragging = "start"
+                return
+            if abs(x - end_x) <= HANDLE_HIT_RADIUS_PX:
+                self._dragging = "end"
+                return
 
-        # ハンドル以外の場所（現在位置線を含むバー全体）はシーク用のドラッグ
-        # 対象とする。押した瞬間に一度シークし、そのままドラッグを継続すると
-        # mouseMoveEvent側で連続的にシークする（スクラブ操作）。
+        # 上記以外の場所（バー本体、下部の現在地三角マークを含む）は
+        # シーク用のドラッグ対象とする。押した瞬間に一度シークし、
+        # そのままドラッグを継続するとmouseMoveEvent側で連続的に
+        # シークする（スクラブ操作）。
         self._dragging = "position"
         ms = self._x_to_ms(x)
         ms = min(max(ms, self._start_ms), self._end_ms)
@@ -166,10 +206,10 @@ class CustomTimeline(QWidget):
         ms = self._x_to_ms(x)
 
         if self._dragging == "start":
-            self._start_ms = self._clamp_start(ms)
+            self._start_ms = self._clamp_start_for_drag(ms)
             self.start_changed.emit(self._start_ms)
         elif self._dragging == "end":
-            self._end_ms = self._clamp_end(ms)
+            self._end_ms = self._clamp_end_for_drag(ms)
             self.end_changed.emit(self._end_ms)
         elif self._dragging == "position":
             ms = min(max(ms, self._start_ms), self._end_ms)
@@ -210,6 +250,14 @@ class VideoWidget(QWidget):
 
     def load(self, path: str) -> None:
         self.player.setSource(QUrl.fromLocalFile(path))
+        # 読み込み直後は何も描画されず、再生ボタンを押すまで画面が
+        # 真っ暗になる問題への対応。play()→pause()で先頭フレームを
+        # デコード・描画させてからpositionを0に戻す（durationChangedを
+        # 待たずに呼んでもQt側でキューされ正しく動作することを実機
+        # 検証済み）。
+        self.player.play()
+        self.player.pause()
+        self.player.setPosition(0)
 
     def play(self) -> None:
         position = self.player.position()

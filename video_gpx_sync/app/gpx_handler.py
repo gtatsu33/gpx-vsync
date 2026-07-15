@@ -19,6 +19,39 @@ class GPXHandler:
             gpx = gpxpy.parse(f)
         return cls(gpx=gpx)
 
+    @classmethod
+    def from_camm_points(
+        cls, camm_points: list[tuple[int, float, float, float, float]]
+    ) -> "GPXHandler":
+        """動画に埋め込まれたCAMM GPSトラック
+        （camm_encoder.extract_gps_track()の戻り値。(relative_ms,
+        latitude, longitude, elevation, epoch_time)のリスト）から、
+        実時刻付きのGPXHandlerを構築する（22章）。epoch_time（実際の
+        撮影時刻）のみを使い、relative_ms（動画自身のタイムライン上の
+        位置）は無視する。以降は通常のGPX読み込みと全く同じ
+        GPXHandlerパイプライン（オフセット調整・マップ表示・出力）で
+        扱える。"""
+        points = [
+            gpxpy.gpx.GPXTrackPoint(
+                latitude=lat,
+                longitude=lon,
+                elevation=elevation,
+                time=datetime.datetime.fromtimestamp(
+                    epoch_time, tz=datetime.timezone.utc
+                ),
+            )
+            for _relative_ms, lat, lon, elevation, epoch_time in camm_points
+        ]
+        points.sort(key=lambda p: p.time)
+
+        gpx = gpxpy.gpx.GPX()
+        track = gpxpy.gpx.GPXTrack()
+        segment = gpxpy.gpx.GPXTrackSegment()
+        segment.points = points
+        track.segments.append(segment)
+        gpx.tracks.append(track)
+        return cls(gpx=gpx)
+
     def get_all_points(self) -> list[gpxpy.gpx.GPXTrackPoint]:
         """全トラック・全セグメントのポイントを時刻順に結合して返す。"""
         points = [
@@ -121,6 +154,77 @@ class GPXHandler:
             video_start_ms, video_end_ms, offset_sec, video_creation_time, video_time_scale
         )
         return raw_start <= points[-1].time and raw_end >= points[0].time
+
+    def _raw_time_to_video_ms(
+        self,
+        raw_time: datetime.datetime,
+        offset_sec: float,
+        video_creation_time: datetime.datetime,
+        video_time_scale: float,
+    ) -> int:
+        """_raw_time_range()の逆変換。GPXの生の記録時刻軸上の時刻から、
+        対応する動画再生位置(ms)を求める。"""
+        real_ms = round(
+            (
+                raw_time - video_creation_time - datetime.timedelta(seconds=offset_sec)
+            ).total_seconds()
+            * 1000
+        )
+        return real_ms_to_playback_ms(real_ms, video_time_scale)
+
+    def clip_to_gps_coverage(
+        self,
+        video_start_ms: int,
+        video_end_ms: int,
+        offset_sec: float,
+        video_creation_time: datetime.datetime,
+        video_time_scale: float = 1.0,
+    ) -> tuple[int, int]:
+        """動画のStart/Endを、GPXが実際に記録している範囲でカバーされる
+        区間にクロップした(video_start_ms, video_end_ms)を返す。
+        Start-End全体が既にGPXの記録範囲内に収まっている場合は、元の値を
+        そのまま返す（クロップ不要）。GPXに記録点が無い場合も元の値を
+        そのまま返す（has_overlap()等で別途ガードされている前提）。
+        GPS未記録区間の可視化には値の変化の有無を使う（MainWindow
+        _confirm_and_apply_gps_coverage_crop()）。"""
+        points = self.get_all_points()
+        if not points:
+            return video_start_ms, video_end_ms
+
+        raw_start, raw_end = self._raw_time_range(
+            video_start_ms, video_end_ms, offset_sec, video_creation_time, video_time_scale
+        )
+
+        new_start_ms = video_start_ms
+        new_end_ms = video_end_ms
+
+        if raw_start < points[0].time:
+            new_start_ms = self._raw_time_to_video_ms(
+                points[0].time, offset_sec, video_creation_time, video_time_scale
+            )
+        if raw_end > points[-1].time:
+            new_end_ms = self._raw_time_to_video_ms(
+                points[-1].time, offset_sec, video_creation_time, video_time_scale
+            )
+
+        return new_start_ms, new_end_ms
+
+    def classify_points_in_range(
+        self,
+        video_start_ms: int,
+        video_end_ms: int,
+        offset_sec: float,
+        video_creation_time: datetime.datetime,
+        video_time_scale: float = 1.0,
+    ) -> list[bool]:
+        """get_all_points()と同じ順序・点数で、各点が動画のStart/End出力
+        範囲内（＝raw_time_range内）かどうかを返す。マップ上でのルート線の
+        色分け表示（クロップされる領域の可視化）に使う。"""
+        points = self.get_all_points()
+        raw_start, raw_end = self._raw_time_range(
+            video_start_ms, video_end_ms, offset_sec, video_creation_time, video_time_scale
+        )
+        return [raw_start <= p.time <= raw_end for p in points]
 
     def _build_output_points(
         self,

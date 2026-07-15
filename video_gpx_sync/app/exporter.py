@@ -60,7 +60,20 @@ class Exporter:
             counter += 1
         return candidate_path
 
-    def export(self, state: AppState, output_dir: str) -> tuple[str, str]:
+    def default_video_filename(self, state: AppState) -> str:
+        """保存ダイアログ（QFileDialog.getSaveFileName）に初期表示する
+        動画ファイル名。generate_output_path()と同じ命名規則（重複時の
+        連番は付与しない。保存ダイアログ自体がOS標準の上書き確認を
+        行うため）。"""
+        assert state.video_path is not None
+        base = os.path.splitext(os.path.basename(state.video_path))[0]
+        return f"{base}_synced.mp4"
+
+    def export(self, state: AppState, video_output_path: str) -> tuple[str, str]:
+        """video_output_path: 動画の保存先フルパス（拡張子込み。
+        保存ダイアログでユーザーが指定した値をそのまま使う）。
+        GPXファイルは、動画と同じディレクトリに従来通り
+        generate_output_path()で自動生成した名前で出力する。"""
         if not self.can_export(state):
             raise ValueError(
                 "GPXとオフセット適用後の時刻範囲が動画Start〜Endと重複しないため出力できません"
@@ -71,9 +84,7 @@ class Exporter:
         assert state.gpx_data is not None
         assert state.video_creation_time is not None
 
-        video_output_path = self.generate_output_path(
-            output_dir, state.video_path, ".mp4"
-        )
+        output_dir = os.path.dirname(video_output_path)
         gpx_output_path = self.generate_output_path(
             output_dir, state.gpx_path, ".gpx"
         )

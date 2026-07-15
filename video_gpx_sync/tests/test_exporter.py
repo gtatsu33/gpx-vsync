@@ -90,12 +90,16 @@ def test_generate_output_path_with_collision_gets_sequence_number(
     assert result2 == str(tmp_path / "ride01_synced_3.mp4")
 
 
+def test_default_video_filename(exporter: Exporter, base_state: AppState) -> None:
+    assert exporter.default_video_filename(base_state) == "ride01_synced.mp4"
+
+
 def test_export_raises_when_cannot_export(
     exporter: Exporter, base_state: AppState, tmp_path
 ) -> None:
     base_state.offset_seconds = 1000.0
     with pytest.raises(ValueError):
-        exporter.export(base_state, str(tmp_path))
+        exporter.export(base_state, str(tmp_path / "out.mp4"))
 
 
 def test_export_calls_video_handler_and_embeds_camm_and_writes_gpx(
@@ -103,13 +107,16 @@ def test_export_calls_video_handler_and_embeds_camm_and_writes_gpx(
 ) -> None:
     output_dir = tmp_path / "out"
     output_dir.mkdir()
+    video_output_path_arg = str(output_dir / "my_custom_name.mp4")
 
     with patch("app.exporter.embed_gps_track") as mock_embed:
         video_output_path, gpx_output_path = exporter.export(
-            base_state, str(output_dir)
+            base_state, video_output_path_arg
         )
 
-    assert video_output_path == str(output_dir / "ride01_synced.mp4")
+    # 動画側は保存ダイアログで指定されたパスをそのまま使う（連番付与なし）
+    assert video_output_path == video_output_path_arg
+    # GPX側は従来通りgpx_pathベースで自動生成される
     assert gpx_output_path == str(output_dir / "ride01_synced.gpx")
 
     # VideoHandler.export_trimmed は一時パスにSmart Cut出力を書き出す
@@ -162,7 +169,7 @@ def test_export_camm_points_reflect_time_scale(
     output_dir.mkdir()
 
     with patch("app.exporter.embed_gps_track") as mock_embed:
-        exporter.export(base_state, str(output_dir))
+        exporter.export(base_state, str(output_dir / "out.mp4"))
 
     camm_points = mock_embed.call_args.args[2]
     assert len(camm_points) > 0

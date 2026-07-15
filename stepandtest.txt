@@ -280,6 +280,208 @@
         待機する（fair-use対応）
       対応implement.txtセクション: 4-11, 13
 
+  Step 17: UIテーマ刷新（グリーン基調・カードUI・ライト/ダーク対応）
+    17-1. theme.py新設（app/theme.py）
+      - Palette（accent/accent_hover/accent_bg/accent_border/bg/
+        card_bg/border/text/text_subtleの9トークン）とLIGHT/DARK定数
+      - build_stylesheet(p) でQSS文字列を組み立て
+      - resolve_palette(app) でQApplication.styleHints().colorScheme()
+        からmacOSのライト/ダークを判定（Unknown時はLightにフォールバック）
+      - apply_theme(app) で上記をまとめてapp.setStyleSheet()に適用
+      - main.pyのQApplication生成直後に1回呼び出す
+    17-2. MainWindow変更（app/main_window.py）
+      - 左右ペインをQWidget→QFrame(objectName="card")に変更
+      - ExportボタンにobjectName="primaryButton"を付与
+      - レイアウト各所に余白/間隔を追加
+      - Exportボタンラベルの"&"を"&&"にエスケープ（ニーモニック誤解釈の
+        既存不具合を副次的に修正）
+    17-3. CustomTimeline・地図ルート線の配色統一
+      - app/video_widget.py: 選択範囲ハイライトを青系→アクセント
+        グリーン系に変更（色定数化）
+      - assets/map_template.html: ルートポリラインを'blue'→'#16a34a'に変更
+      対応implement.txtセクション: 4-1, 4-17, 8, 16
+
+  Step 18: カードヘッダーの開くボタン・マップマッチング結果表示
+    18-1. theme.py拡張（app/theme.py）
+      - Paletteにwarn/errorのセマンティックカラーを追加
+      - QLabel[state="ok"|"warn"|"error"] のQSSセレクタを追加
+    18-2. MainWindow変更（app/main_window.py）
+      - 左右カードのヘッダー行にopen_gpx_button/open_video_buttonを追加
+        （クリックで既存のopen_gpx_dialog()/open_video_dialog()を呼ぶ）
+      - _set_button_emphasis()/_update_open_button_emphasis()を新設し、
+        未読み込み状態のボタンをobjectName="primaryButton"化して強調
+        （__init__/load_gpx()末尾/load_video()末尾で呼ぶ）
+      - _run_map_matching()の戻り値をpointsからGpxMatchResult全体に変更
+      - _update_map_matching_status(result, total_points)を新設し、
+        map_matching_status_label（左カード）に結果を反映
+        （error is Noneかどうかを優先した状態判定。17章参照）
+      対応implement.txtセクション: 4-1, 4-17, 17
+
+  Step 19: 動画情報表示・チェックボックスの見た目改善
+    19-1. チェックマークアイコン追加（assets/icons/check.svg, app/theme.py）
+      - 白いチェックマークSVGを新規追加
+      - theme.pyにCHECKMARK_ICON_PATHを定義し、
+        QCheckBox::indicator:checkedにimage: url(...)で適用
+    19-2. MainWindow変更（app/main_window.py）
+      - 右カード（動画）のヘッダー行直下にvideo_info_labelを追加
+        （左カードのmap_matching_status_labelと同じ位置に配置し、
+        上下位置を揃える）
+      - _update_video_info_label(interval_sec)を新設し、
+        fps・タイムラプス間隔を表示。on_timelapse_changed()末尾から
+        呼ぶことで、load_video()時・常設チェックボックス操作時の
+        両方で自動更新されるようにする
+      対応implement.txtセクション: 4-1, 4-17, 18
+
+  Step 20: 現在地インジケーターへの三角マーク追加（CustomTimeline）
+    20-1. app/video_widget.py変更
+      - _draw_handle()にflip: bool = Falseパラメータを追加し、
+        Start/Endハンドル（バー上端から上向き）と現在地マーカー
+        （バー下端から下向き、上部の鏡像）の両方を1メソッドで
+        描画できるようにする
+      - paintEvent()の現在位置の縦線描画直後に、
+        _draw_handle(painter, pos_x, rect.bottom(),
+        POSITION_LINE_COLOR, flip=True) を追加
+      対応implement.txtセクション: 4-4
+
+  Step 21: シーク領域のヒット判定修正・現在地マーカーの配色変更
+    21-1. app/video_widget.py変更
+      - mousePressEvent()にY座標のゾーン判定を追加。
+        rect.top()以下（バー上端より上＝上部三角マークの領域）を
+        押した場合のみStart/Endハンドルとして反応するようにし、
+        バー本体・現在地の下部三角マークではX座標がStart/Endに
+        近くてもposition（シーク）として扱われるようにする
+        （現在地ドラッグのつもりでStart/Endが動いてしまう不具合の修正）
+      - POSITION_LINE_COLORをEND_HANDLE_COLOR（赤系）と紛らわしい
+        赤 QColor(220,0,0) から青 QColor(37,99,235) に変更
+      対応implement.txtセクション: 4-4
+
+  Step 22: 再生制御ボタン群の移動・逆再生/コマ送り機能
+    22-1. app/main_window.py変更
+      - REVERSE_TICK_MS定数、self._reverse_timer（QTimer）を追加
+      - play_button/pause_button/current_time_labelをウィンドウ下部から
+        動画カード内・CustomTimelineの直下（transport_layout）へ移動し、
+        新たにreverse_button/step_back_button/step_forward_buttonを追加
+        （順序: 逆再生・コマ戻り・一時停止・コマ送り・再生）
+      - _current_playback_rate()を新設し、_apply_playback_rate()と
+        _on_reverse_tick()で共通利用する
+      - on_play_clicked()を新設（_stop_reverse_timer() + video_widget.play()）。
+        play_button.clickedの接続先をvideo_widget.playから変更
+      - on_reverse_clicked() / _on_reverse_tick() / _stop_reverse_timer()を
+        新設し、QTimerでposition()を少しずつ減算する疑似逆再生を実装
+        （QMediaPlayerの負のplaybackRateは実機で0.0に丸められ機能しない
+        ことを確認済み。19章）
+      - on_step_back_clicked() / on_step_forward_clicked() / _step_frame()
+        を新設。fpsから1フレーム分のmsを算出し、video_widget.seek()で
+        Start/Endにクランプしつつ移動する
+      - _update_frame_step_buttons_enabled()を新設し、fps取得可否に
+        応じてコマ送り・コマ戻りボタンの有効/無効を切り替える
+      - load_video()・closeEvent()冒頭で_stop_reverse_timer()を呼ぶ
+      対応implement.txtセクション: 4-1, 8, 19
+
+  Step 23: 先頭フレームの即時表示・Start/Endドラッグの現在地制約
+    23-1. app/video_widget.py変更
+      - VideoWidget.load(): setSource()の直後にplay()→pause()→
+        setPosition(0)を追加し、再生操作をしなくても先頭フレームが
+        表示されるようにする
+      - CustomTimelineに_clamp_start_for_drag()/_clamp_end_for_drag()
+        を新設し、mouseMoveEventのStart/Endドラッグ処理から
+        _clamp_start()/_clamp_end()の代わりに呼び出すよう変更。
+        Startは現在地(position_ms)より後ろに、Endは現在地より前に
+        ドラッグできないようにする（set_start()/set_end()自体の
+        挙動は変更しない。4-4節参照）
+      対応implement.txtセクション: 4-3, 4-4
+
+  Step 24: マップ上でのクロップ領域の可視化
+    24-1. app/gpx_handler.py変更
+      - classify_points_in_range()を新設。get_all_points()と同じ
+        順序でin_range: list[bool]を返す（_raw_time_range()の
+        範囲判定をhas_overlap()と共用）
+    24-2. app/map_widget.py / assets/map_template.html変更
+      - MapWidget.update_route_ranges(in_range)を新設
+      - map_template.html: loadRoute()はcurrentLatLngsに座標を保持する
+        よう変更。updateRouteRanges(inRangeFlags)/
+        renderRouteSegments()/splitIntoSegments()/clearRouteSegments()
+        を新設し、in_rangeの切り替わり目でポリラインをセグメント分割
+        して再描画する。範囲内は緑の太線、範囲外は緑の下地+グレーの
+        重ね描きで「緑の枠線が覗くグレーの太線」にする
+    24-3. app/main_window.py変更
+      - _update_route_range_highlight()を新設し、on_start_changed() /
+        on_end_changed() / on_offset_changed() / on_duration_changed() /
+        on_timelapse_changed()から呼ぶ
+      対応implement.txtセクション: 4-1, 4-2, 4-6, 9, 20
+
+  Step 25: 出力前のGPSカバレッジ確認・自動クロップ
+    25-1. app/gpx_handler.py変更
+      - clip_to_gps_coverage()を新設。Start/EndがGPXの実記録範囲を
+        はみ出している分だけ記録範囲側に切り詰めた(start_ms, end_ms)
+        を返す（完全にカバーされている場合はそのまま返す）
+      - _raw_time_to_video_ms()を新設（_raw_time_range()の逆変換、
+        clip_to_gps_coverage()専用の内部ヘルパー）
+    25-2. app/main_window.py変更
+      - _confirm_and_apply_gps_coverage_crop()を新設。クロップ不要なら
+        確認なしでTrue、必要な場合は
+        「GPSデータのない動画フレームが存在するため、動画をクロップ
+        します。よろしいですか？」を確認しOKならStart/Endをクロップして
+        True、キャンセルならFalseを返す
+      - on_export_clicked()冒頭で呼び、Falseの場合は出力先選択ダイアログ
+        より前に処理を中断する
+      対応implement.txtセクション: 4-1, 4-6, 21
+
+  Step 26: 出力ダイアログの保存ダイアログ化
+    26-1. app/exporter.py変更
+      - default_video_filename(state)を新設（保存ダイアログの初期
+        表示ファイル名。従来のvideo側自動生成命名規則と同じ）
+      - export()の第2引数をoutput_dirからvideo_output_pathに変更。
+        動画はvideo_output_pathをそのまま使用（連番付与なし）、GPXは
+        その親ディレクトリに従来通りgenerate_output_path()で自動生成
+    26-2. app/main_window.py変更
+      - on_export_clicked(): QFileDialog.getExistingDirectory()を
+        QFileDialog.getSaveFileName()に変更。初期表示名は
+        default_video_filename()、フィルタは"MP4 Files (*.mp4)"
+      対応implement.txtセクション: 4-1, 4-9, 22
+
+  Step 27: GPXデータの取得元統合・読み込み順序ルール撤廃・検証モード廃止
+    27-1. app/camm_encoder.py変更
+      - extract_gps_track()/_parse_nhml_camm()がtime_gps_epochを
+        読み捨てずに返すよう変更（embed_gps_track()と対称な5要素
+        タプルに）
+      - interpolate_camm_points()を削除（検証モード廃止に伴い
+        呼び出し元が無くなったため）
+    27-2. app/gpx_handler.py変更
+      - from_camm_points()を新設（classmethod）。CAMM抽出点
+        （5要素タプル）から実時刻付きのGPXHandlerを構築する
+    27-3. app/main_window.py変更
+      - load_gpx()/load_video()相互の「先読み込み必須」ガードを撤廃
+      - _apply_gps_source()を新設し、GPXファイル読み込み・動画の
+        CAMM埋め込み抽出のいずれの経路でも同じ処理でGPXデータを
+        上書きするようにする（最後勝ちルール）
+      - _try_load_embedded_gps()を新設し、load_video()末尾近くで
+        CAMM埋め込みの有無を確認、あれば_apply_gps_source()を呼ぶ
+      - _update_gps_source_status_for_camm() /
+        _set_map_matching_status_label()（共通ヘルパー）を新設
+      - _update_open_button_emphasis()の判定を、GPX・動画それぞれ
+        独立した条件に変更
+      - dragEnterEvent/dropEventを簡略化（GPX未読み込み時の動画
+        ドロップ拒否を撤廃）
+      - _prompt_creation_time()のgpx_handler前提assertを撤廃
+      - 「ツール」メニュー（検証モードを開く）を削除
+    27-4. ファイル削除
+      - app/verification_window.py
+      - tests/test_verification_window.py
+      対応implement.txtセクション: 4-1, 4-6, 4-8, 4-10, 23
+
+  Step 28: CAMM埋め込み動画のcreation_time不具合修正
+    28-1. app/main_window.py変更
+      - _try_load_embedded_gps()に、CAMM先頭サンプル
+        （relative_ms最小）のepoch_timeでstate.video_creation_time
+        を上書きする処理を追加。MP4Boxがトラック追加時に動画
+        コンテナのcreation_timeを実行時刻で上書きしてしまう
+        （4-8節「制約3」）ため、ffprobe由来の値は信用しない
+      背景: 実際にエクスポート済み動画を単体で読み込んだところ、
+      マップ上のルートが全区間グレー表示になり、マーカーも動かない
+      という報告を受け、実機再現の上で特定・修正した
+      対応implement.txtセクション: 4-1, 23
+
 
 3. テスト方針
 ----------------------------------------------------------------
@@ -551,6 +753,231 @@
       おおむねMIN_REQUEST_INTERVAL_SEC相当の値になっているか
     - 1チャンクのみで完結する場合はsleep_implが一切呼ばれないか
     - 既存のチャンク失敗時のキャンセル/継続ロジックに回帰が無いか
+
+  Step 17-1: theme（配色パレット・QSS適用）
+    種別: pytest ユニットテスト + headlessスクリーンショットによる目視確認
+    - resolve_palette()がQt.ColorScheme.Darkの時DARKを、それ以外
+      （Light/Unknown）の時LIGHTを返すか
+    - build_stylesheet()が各パレットのトークン値を含むQSS文字列を
+      生成するか
+    - QT_QPA_PLATFORM=offscreen環境でMainWindowにapply_theme()を適用し
+      grab()でスクリーンショットを撮影、カードUI・primaryButtonの
+      強調表示・ライト/ダーク両方の見た目を目視確認（実施済み）
+
+  Step 17-2: MainWindow（既存回帰確認）
+    種別: pytest-qt ウィジェットテスト（既存テストの回帰確認のみ、
+         見た目の変更自体はスナップショットテスト化せず目視確認に留める）
+    - test_export_button_label_is_export_and_test をラベルの
+      エスケープ表記("&&")に合わせて更新
+    - 既存の全テストが引き続き成功するか（オブジェクト構成・
+      シグナル配線は変更していないため回帰は想定していない）
+
+  Step 18-1: MainWindow（開くボタンの強調表示）
+    種別: pytest-qt ウィジェットテスト
+    - 初期状態: open_gpx_buttonのみprimaryButton、open_video_buttonは
+      disabledで強調なし
+    - load_gpx()後: open_gpx_buttonの強調が外れ、open_video_buttonが
+      有効化・強調されるか
+    - load_video()後: open_video_buttonの強調が外れるか
+
+  Step 18-2: MainWindow（マップマッチング結果表示）
+    種別: pytest-qt ウィジェットテスト（match_chunk_implを注入し
+         実通信を避ける。CHUNK_SIZEをmonkeypatchして複数チャンクの
+         部分失敗ケースも再現する）
+    - 全チャンク成功時: state="ok"、「完了」を含む文言が表示されるか
+    - 一部チャンク失敗時（2チャンク目以降）: state="warn"、
+      「一部失敗」を含む文言が表示されるか
+    - 1チャンク目失敗（自動キャンセル）時: state="error"、
+      「中断」を含む文言が表示されるか
+    - n_snapped==0でもerrorがNoneならstate="ok"扱いになるか
+      （match_route()のstatus="エラー"がチャンク失敗を意味しない
+      ケースとの区別。17章参照）
+
+  Step 19-1: theme（チェックマークアイコン）
+    種別: pytest ユニットテスト
+    - CHECKMARK_ICON_PATHのファイルが実在するか
+    - build_stylesheet()の出力にCHECKMARK_ICON_PATHを使った
+      image: url(...)指定が含まれるか
+    - LIGHT/DARK双方のパレットトークン（accent/warn/error）が
+      QSS文字列に含まれるか
+
+  Step 19-2: MainWindow（動画情報ラベル）
+    種別: pytest-qt ウィジェットテスト
+    - 通常動画読み込み後: video_info_labelが表示され、
+      「{fps:.2f}fps」形式のテキストになるか（タイムラプス文言を
+      含まないこと）
+    - タイムラプス有効で読み込んだ場合:
+      「{fps:.2f}fps（{interval}sタイムラプス）」になるか
+    - 読み込み後、常設のタイムラプス設定チェックボックスを手動で
+      切り替えた場合もラベルが追従して更新されるか
+
+  Step 20-1: CustomTimeline（現在地マーカーの三角）
+    種別: headlessスクリーンショットによる目視確認（既存のCustomTimeline
+         描画系統に単体テストが無い方針に合わせ、_draw_handle()の
+         flipパラメータについても専用のpytestは追加せず、実機
+         スクリーンショットでStart/Endハンドルとの鏡像関係を
+         目視確認するに留めた）
+    - 現在地の縦線の下部に、Start/Endハンドルと同形・同サイズの
+      三角形が上下反転して表示されるか（実施済み。当時の縦線の色は
+      赤だったが、Step 21で青に変更している）
+
+  Step 21-1: CustomTimeline（ヒット判定・配色）
+    種別: pytest-qt ウィジェットテスト
+    - X座標がStart/EndのX位置に近くても、Y座標がバー下部
+      （現在地マーカーの領域）の場合はStart/Endが動かず、代わりに
+      seek_requestedが発火するか
+      （test_click_near_start_x_but_on_bottom_marker_area_seeks_instead）
+    - 既存のStart/Endハンドルドラッグテストは、Y座標を上部三角
+      マークの領域（HANDLE_Y=28、rect.top()=32より上）に修正した上で
+      引き続き成功するか（回帰確認）
+    種別: headlessスクリーンショットによる目視確認
+    - 現在地マーカー（線・下部三角）が青、Endハンドルが赤で
+      視覚的に区別できるか（実施済み）
+
+  Step 22-1: MainWindow（コマ送り・コマ戻り）
+    種別: pytest-qt ウィジェットテスト
+    - コマ送り/コマ戻りが、動画fps（sample.mp4は30fps確認済み）から
+      算出した1フレーム分（round(1000/fps)ms）だけ正確に位置を
+      移動させるか
+    - Endマーカー付近でコマ送りした場合、Endでクランプされるか
+    - fps取得に失敗した場合、コマ送り・コマ戻りボタンが無効化されるか
+
+  Step 22-2: MainWindow（疑似逆再生）
+    種別: pytest-qt ウィジェットテスト（実タイマー待ちにせず、
+         _on_reverse_tick()を直接複数回呼び出して決定的に検証する）
+    - on_reverse_clicked()でタイマーが起動するか
+    - タイマーのティックを繰り返すと位置が単調に減少し、
+      Startマーカー位置に到達した時点で位置がStartに一致し、
+      タイマーが自動停止するか
+    - on_play_clicked() / on_pause_clicked()を呼ぶと、動作中の
+      逆再生タイマーが停止するか
+    種別: headlessスクリーンショットによる目視確認
+    - シークバー直下に「⏪ 逆再生」「⏮ コマ戻り」「⏸ 一時停止」
+      「⏭ コマ送り」「▶ 再生」の順でボタンが並び、右に現在時刻が
+      表示されるか（実施済み。QWebEngineViewのheadless描画が不安定
+      だったため、MainWindow全体ではなく右カード相当の構成を単独で
+      構築して確認した）
+
+  Step 23-1: VideoWidget（先頭フレームの即時表示）
+    種別: pytest-qt ウィジェットテスト + headlessスクリーンショットに
+         よる目視確認
+    - load()完了後、playbackStateがPlayingStateでなく、position()が
+      0であるか（一時停止・先頭フレームの状態になっているか）
+    - VideoWidgetを単独でheadless起動しload()した後、grab()した
+      画像が有効な320x240のフレームになっているか（実施済み。
+      QMediaPlayer.videoSink().videoFrameChanged が offscreen環境
+      では発火しないため、frame自体の内容比較ではなくgrab()の
+      非null判定・playbackState/positionの状態で確認した）
+
+  Step 23-2: CustomTimeline（Start/Endドラッグの現在地制約）
+    種別: pytest-qt ウィジェットテスト
+    - 現在地(position_ms)より後ろにStartをドラッグしようとしても、
+      現在地の位置で止まるか（test_drag_start_handle_cannot_pass_current_position）
+    - 現在地(position_ms)より前にEndをドラッグしようとしても、
+      現在地の位置で止まるか（test_drag_end_handle_cannot_pass_current_position）
+    - set_start()/set_end()（プログラム的な呼び出し）はこの制約の
+      対象外のままか（既存のtest_seek_clamps_to_start_end_range等の
+      回帰確認）
+    - 既存のStart/Endドラッグテストは、position_msをドラッグ先より
+      後方/前方に設定した上で引き続き成功するか（回帰確認）
+
+  Step 24-1: GPXHandler（classify_points_in_range）
+    種別: pytest ユニットテスト
+    - Start/Endの範囲内外が正しくbool列として返るか
+    - オフセット・タイムラプス倍率(video_time_scale)が反映されるか
+
+  Step 24-2: MapWidget / map_template.html（ルート塗り分け）
+    種別: pytest ユニットテスト（runJavaScriptをモック化しJS呼び出し
+         文字列を検証） + 実Leafletページに対する実機検証
+    - update_route_ranges()がupdateRouteRanges([...])という正しい
+      JS呼び出し文字列を生成するか
+    - 実際のLeafletページ（ネットワーク接続時のみ）に対しloadRoute()→
+      update_route_ranges()を実行し、routeSegmentsの区間数・各区間の
+      色・太さ・点数が意図通りに分割されるか（実施済み。10点のうち
+      中央5点をin_range=Trueとしたケースで、範囲外セグメント2本
+      （境界点を含めてn=2, n=4）+ 範囲内セグメント1本（n=6）、
+      計3レイヤー、いずれもweight=3（範囲内#16a34a/範囲外#6b7280）に
+      なることを確認。2026-07-15、当初は範囲外に緑の下地(weight5)を
+      重ねる縁取り付きの5レイヤー構成だったが、太さの見た目が
+      不自然というフィードバックを受け縁取りを廃止した）
+
+  Step 24-3: MainWindow（塗り分けの再計算タイミング）
+    種別: pytest-qt ウィジェットテスト（MapWidget.update_route_rangesを
+         モック化し呼び出し引数を検証）
+    - on_end_changed()でend_msを変更すると、変更後のStart/Endに
+      対応した正しいin_rangeでupdate_route_rangesが呼ばれるか
+
+  Step 25-1: GPXHandler（clip_to_gps_coverage）
+    種別: pytest ユニットテスト
+    - 完全にカバーされている場合は値が変化しないか
+    - Start側のみ/End側のみ/両方がGPX記録範囲外の場合に、それぞれ
+      正しくクロップされるか
+    - オフセットを伴うケースでも正しくクロップされるか
+
+  Step 25-2: MainWindow（出力前の確認・クロップ適用）
+    種別: pytest-qt ウィジェットテスト（QMessageBox.questionをモック化）
+    - GPXがStart-End全体を完全にカバーしている場合、確認ダイアログを
+      表示せずTrueを返すか
+    - カバーしていない場合に確認ダイアログを表示し、OKならStart/Endを
+      クロップしてTrueを返すか（state・timelineの表示の両方が
+      更新されるか）
+    - キャンセルなら状態を変更せずFalseを返すか
+
+  Step 26-1: Exporter（保存ダイアログ対応）
+    種別: pytest ユニットテスト
+    - default_video_filename()が元動画ファイル名ベースの
+      "{base}_synced.mp4"を返すか
+    - export()に渡したvideo_output_pathがそのまま動画の出力先になり、
+      連番が付与されないか
+    - GPX側は従来通りgpx_pathベースの自動命名になるか（回帰確認）
+
+  Step 26-2: MainWindow（保存ダイアログの呼び出し）
+    種別: pytest-qt ウィジェットテスト（QFileDialog.getSaveFileNameを
+         モック化）
+    - on_export_clicked()が正しいキャプション・初期表示ファイル名
+      （default_video_filename()の値）・フィルタでgetSaveFileName()を
+      呼ぶか
+    - キャンセル（空文字列が返る）した場合、export()が呼ばれずに
+      処理が中断されるか
+
+  Step 27-1: GPXHandler（from_camm_points）
+    種別: pytest ユニットテスト
+    - relative_msの順序が崩れていても、epoch_time順に正しく
+      ソートされたGPXTrackPoint列になるか
+    - 緯度・経度・標高・時刻（tzinfo付き）が正しく反映されるか
+
+  Step 27-2: CammEncoder（extract_gps_track の5要素化）
+    種別: pytest ユニットテスト（MP4Box必須、無ければskip）
+    - embed_gps_track() → extract_gps_track() の往復で、
+      time_gps_epochを含む5要素すべてが完全一致するか
+
+  Step 27-3: MainWindow（読み込み順序ルール撤廃・最後勝ちルール）
+    種別: pytest-qt ウィジェットテスト（CAMM関連はMP4Box必須、
+         無ければskip）
+    - GPX未読み込みでも動画が正常に読み込めるか（従来は警告して
+      中断していた）
+    - CAMM埋め込み動画を読み込むと、それだけでGPXデータが自動的に
+      採用されるか（マップマッチングは適用されず、専用のステータス
+      文言「✓ 動画に埋め込まれたGPSデータを使用」が表示されるか）
+    - CAMM埋め込みが無い動画を読み込んでも、既存のGPXデータが
+      変更されないか
+    - GPX読み込み後にCAMM埋め込み動画を読み込むと、動画側のGPSデータ
+      が優先されるか（最後勝ち）
+    - CAMM埋め込み動画読み込み後にGPXファイルを読み込むと、GPX側が
+      優先され、通常通りマップマッチングも適用されるか（最後勝ち）
+    - 初期状態でopen_video_action/open_video_buttonが常にenabledか
+
+  Step 28-1: MainWindow（CAMM動画のcreation_time不具合の回帰確認）
+    種別: pytest-qt ウィジェットテスト（MP4Box必須、無ければskip）
+    - CAMM埋め込み動画読み込み後、state.video_creation_timeが
+      CAMMの埋め込みepoch_time由来の正しい値になっているか
+      （ffprobeのcreation_timeメタデータ書き換えの影響を受けないか）
+    - classify_points_in_range()が全区間Trueになるか
+      （実機で発生した「全区間グレー表示」不具合の再発防止）
+    - interpolate_position()がNoneを返さないか
+      （実機で発生した「マーカーが動かない」不具合の再発防止）
+    （test_camm_video_creation_time_uses_embedded_epoch_not_corrupted_metadata。
+    実施済み）
 
 
 4. 開発用依存パッケージ

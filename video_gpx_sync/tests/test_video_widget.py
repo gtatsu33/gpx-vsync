@@ -72,12 +72,17 @@ def test_drag_on_bar_scrubs_continuously(timeline: CustomTimeline, qtbot) -> Non
     assert received == []
 
 
+HANDLE_Y = 28.0  # バー上端(top=32)より上、上部三角マークの領域内のY座標
+
+
 def test_drag_end_handle_updates_end_and_emits_signal(
     timeline: CustomTimeline, qtbot
 ) -> None:
     end_x = timeline._ms_to_x(timeline.end_ms())  # ~388 (right edge)
 
-    timeline.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, end_x))
+    timeline.mousePressEvent(
+        _mouse_event(QEvent.Type.MouseButtonPress, end_x, HANDLE_Y)
+    )
     with qtbot.waitSignal(timeline.end_changed, timeout=1000) as blocker:
         timeline.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, 200))
     timeline.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, 200))
@@ -91,7 +96,9 @@ def test_drag_end_handle_cannot_cross_start_below_min_gap(
     timeline: CustomTimeline
 ) -> None:
     end_x = timeline._ms_to_x(timeline.end_ms())
-    timeline.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, end_x))
+    timeline.mousePressEvent(
+        _mouse_event(QEvent.Type.MouseButtonPress, end_x, HANDLE_Y)
+    )
     timeline.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, 0))
     timeline.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, 0))
 
@@ -103,9 +110,14 @@ def test_drag_end_handle_cannot_cross_start_below_min_gap(
 def test_drag_start_handle_updates_start_and_emits_signal(
     timeline: CustomTimeline, qtbot
 ) -> None:
+    # 現在地より後ろにStartを動かせない制約(2026-07-15追加)の影響を
+    # 受けないよう、ドラッグ先より後ろに現在地を設定しておく
+    timeline.set_position(10000)
     start_x = timeline._ms_to_x(timeline.start_ms())  # ~12 (left edge)
 
-    timeline.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, start_x))
+    timeline.mousePressEvent(
+        _mouse_event(QEvent.Type.MouseButtonPress, start_x, HANDLE_Y)
+    )
     with qtbot.waitSignal(timeline.start_changed, timeout=1000) as blocker:
         timeline.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, 200))
     timeline.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, 200))
@@ -115,16 +127,69 @@ def test_drag_start_handle_updates_start_and_emits_signal(
     assert timeline.end_ms() == 10000  # end is untouched
 
 
+def test_drag_start_handle_cannot_pass_current_position(
+    timeline: CustomTimeline, qtbot
+) -> None:
+    # 現在地(position_ms)より後ろにはStartを動かせない
+    timeline.set_position(3000)
+    start_x = timeline._ms_to_x(timeline.start_ms())
+
+    timeline.mousePressEvent(
+        _mouse_event(QEvent.Type.MouseButtonPress, start_x, HANDLE_Y)
+    )
+    # 現在地(3000)を大きく超える位置までドラッグしようとする
+    timeline.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, 200))
+    timeline.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, 200))
+
+    assert timeline.start_ms() == 3000
+
+
+def test_drag_end_handle_cannot_pass_current_position(
+    timeline: CustomTimeline, qtbot
+) -> None:
+    # 現在地(position_ms)より前にはEndを動かせない
+    timeline.set_position(7000)
+    end_x = timeline._ms_to_x(timeline.end_ms())
+
+    timeline.mousePressEvent(
+        _mouse_event(QEvent.Type.MouseButtonPress, end_x, HANDLE_Y)
+    )
+    # 現在地(7000)を大きく下回る位置までドラッグしようとする
+    timeline.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, 200))
+    timeline.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, 200))
+
+    assert timeline.end_ms() == 7000
+
+
 def test_drag_start_handle_cannot_cross_end_below_min_gap(
     timeline: CustomTimeline,
 ) -> None:
     start_x = timeline._ms_to_x(timeline.start_ms())
-    timeline.mousePressEvent(_mouse_event(QEvent.Type.MouseButtonPress, start_x))
+    timeline.mousePressEvent(
+        _mouse_event(QEvent.Type.MouseButtonPress, start_x, HANDLE_Y)
+    )
     # 右端(end=10000ms)を超えるくらい大きく動かそうとする
     timeline.mouseMoveEvent(_mouse_event(QEvent.Type.MouseMove, 500))
     timeline.mouseReleaseEvent(_mouse_event(QEvent.Type.MouseButtonRelease, 500))
 
     assert timeline.start_ms() <= timeline.end_ms() - 100
+
+
+def test_click_near_start_x_but_on_bottom_marker_area_seeks_instead(
+    timeline: CustomTimeline, qtbot
+) -> None:
+    # Start/EndハンドルのX座標に近くても、Y座標がバー下部（現在地の
+    # 下向き三角マークの領域）であれば、Start/Endではなくposition
+    # （シーク）として扱われるべき（2026-07-15修正）。
+    start_x = timeline._ms_to_x(timeline.start_ms())
+    bottom_y = 45.0  # rect.bottom()付近（バー下端より下）
+
+    with qtbot.waitSignal(timeline.seek_requested, timeout=1000):
+        timeline.mousePressEvent(
+            _mouse_event(QEvent.Type.MouseButtonPress, start_x, bottom_y)
+        )
+
+    assert timeline.start_ms() == 0  # startは動いていない
 
 
 @pytest.fixture
@@ -146,6 +211,22 @@ def test_video_widget_load_sets_duration(video_widget: VideoWidget, qtbot) -> No
         video_widget.load(SAMPLE_MP4)
 
     assert video_widget.timeline.duration_ms() == pytest.approx(10000, abs=200)
+
+
+def test_load_primes_first_frame_and_stays_paused_at_zero(
+    video_widget: VideoWidget, qtbot
+) -> None:
+    # 読み込み直後、再生ボタンを押さなくても先頭フレームが表示される
+    # ようにplay()->pause()->setPosition(0)しているため、最終的には
+    # 一時停止・位置0の状態になっているはず（2026-07-15追加）。
+    with qtbot.waitSignal(video_widget.duration_changed, timeout=10000):
+        video_widget.load(SAMPLE_MP4)
+
+    assert (
+        video_widget.player.playbackState()
+        != QMediaPlayer.PlaybackState.PlayingState
+    )
+    assert video_widget.player.position() == 0
 
 
 def test_seek_clamps_to_start_end_range(video_widget: VideoWidget, qtbot) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 from typing import Callable
 
-from PyQt6.QtCore import QDateTime, QUrl, Qt
+from PyQt6.QtCore import QDateTime, QTimer, QUrl, Qt
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -23,9 +24,10 @@ from PyQt6.QtWidgets import (
 )
 
 from app import APP_VERSION
+from app.camm_encoder import CammEncodeError, CammTrackNotFoundError, extract_gps_track
 from app.exporter import Exporter
 from app.gpx_handler import GPXHandler
-from app.map_matcher import match_chunk
+from app.map_matcher import GpxMatchResult, match_chunk
 from app.map_matching_dialog import MapMatchingDialog
 from app.map_matching_worker import MapMatchingWorker
 from app.map_widget import MapWidget
@@ -36,12 +38,12 @@ from app.offset_widget import OffsetWidget
 from app.state import AppState
 from app.time_utils import playback_ms_to_real_ms
 from app.timelapse_widget import DEFAULT_INTERVAL_SEC, TimelapseWidget
-from app.verification_window import VerificationWindow
 from app.video_handler import FFmpegError, VideoHandler
 from app.video_widget import VideoWidget, format_time
 
 GPX_FILE_FILTER = "GPX Files (*.gpx)"
 VIDEO_FILE_FILTER = "Video Files (*.mp4 *.mov *.avi *.mkv *.m4v);;All Files (*)"
+REVERSE_TICK_MS = 40
 
 
 class MainWindow(QMainWindow):
@@ -56,11 +58,13 @@ class MainWindow(QMainWindow):
         self.gpx_handler: GPXHandler | None = None
         self.video_handler = VideoHandler()
         self.exporter = Exporter(video_handler=self.video_handler)
-        self._verification_windows: list[VerificationWindow] = []
         self._match_chunk_impl = match_chunk_impl
         self._is_mapillary_tools_available_impl = is_mapillary_tools_available_impl
         self._validate_export_impl = validate_export_impl
         self._video_fps: float | None = None
+        self._reverse_timer = QTimer(self)
+        self._reverse_timer.setInterval(REVERSE_TICK_MS)
+        self._reverse_timer.timeout.connect(self._on_reverse_tick)
 
         self.setWindowTitle(f"Video-GPX Sync Tool v{APP_VERSION}")
         self.resize(1280, 720)
@@ -70,6 +74,8 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._wire_signals()
         self._update_export_button_state()
+        self._update_open_button_emphasis()
+        self._update_frame_step_buttons_enabled()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -78,21 +84,75 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        left_pane = QWidget()
+        left_pane = QFrame()
+        left_pane.setObjectName("card")
         left_layout = QVBoxLayout(left_pane)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(10)
+
+        left_header = QHBoxLayout()
+        left_title = QLabel("マップ")
+        left_title.setProperty("subtle", True)
+        self.open_gpx_button = QPushButton("GPXを開く")
+        left_header.addWidget(left_title)
+        left_header.addStretch(1)
+        left_header.addWidget(self.open_gpx_button)
+        left_layout.addLayout(left_header)
+
+        self.map_matching_status_label = QLabel("")
+        self.map_matching_status_label.setVisible(False)
+        left_layout.addWidget(self.map_matching_status_label)
+
         self.map_widget = MapWidget()
         self.offset_widget = OffsetWidget()
         left_layout.addWidget(self.map_widget, stretch=1)
         left_layout.addWidget(self.offset_widget)
 
-        right_pane = QWidget()
+        right_pane = QFrame()
+        right_pane.setObjectName("card")
         right_layout = QVBoxLayout(right_pane)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(10)
+
+        right_header = QHBoxLayout()
+        right_title = QLabel("動画")
+        right_title.setProperty("subtle", True)
+        self.open_video_button = QPushButton("動画を開く")
+        right_header.addWidget(right_title)
+        right_header.addStretch(1)
+        right_header.addWidget(self.open_video_button)
+        right_layout.addLayout(right_header)
+
+        self.video_info_label = QLabel("")
+        self.video_info_label.setVisible(False)
+        right_layout.addWidget(self.video_info_label)
+
         self.video_widget = VideoWidget()
-        self.timelapse_widget = TimelapseWidget()
         right_layout.addWidget(self.video_widget, stretch=1)
+
+        transport_layout = QHBoxLayout()
+        transport_layout.setSpacing(8)
+        self.reverse_button = QPushButton("⏪ 逆再生")
+        self.step_back_button = QPushButton("⏮ コマ戻り")
+        self.pause_button = QPushButton("⏸ 一時停止")
+        self.step_forward_button = QPushButton("⏭ コマ送り")
+        self.play_button = QPushButton("▶ 再生")
+        self.current_time_label = QLabel(format_time(0))
+        transport_layout.addWidget(self.reverse_button)
+        transport_layout.addWidget(self.step_back_button)
+        transport_layout.addWidget(self.pause_button)
+        transport_layout.addWidget(self.step_forward_button)
+        transport_layout.addWidget(self.play_button)
+        transport_layout.addStretch(1)
+        transport_layout.addWidget(self.current_time_label)
+        right_layout.addLayout(transport_layout)
+
+        self.timelapse_widget = TimelapseWidget()
         right_layout.addWidget(self.timelapse_widget)
 
         splitter.addWidget(left_pane)
@@ -102,13 +162,9 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(splitter, stretch=1)
 
         button_layout = QHBoxLayout()
-        self.play_button = QPushButton("▶ 再生")
-        self.pause_button = QPushButton("⏸ 一時停止")
-        self.current_time_label = QLabel(format_time(0))
-        self.export_button = QPushButton("\U0001f4e4 Export & Test")
-        button_layout.addWidget(self.play_button)
-        button_layout.addWidget(self.pause_button)
-        button_layout.addWidget(self.current_time_label)
+        button_layout.setSpacing(8)
+        self.export_button = QPushButton("\U0001f4e4 Export && Test")
+        self.export_button.setObjectName("primaryButton")
         button_layout.addStretch(1)
         button_layout.addWidget(self.export_button)
         main_layout.addLayout(button_layout)
@@ -122,19 +178,17 @@ class MainWindow(QMainWindow):
 
         self.open_video_action = QAction("動画を開く...", self)
         self.open_video_action.triggered.connect(self.open_video_dialog)
-        self.open_video_action.setEnabled(False)
         menu.addAction(self.open_video_action)
 
-        tools_menu = self.menuBar().addMenu("ツール")
-        self.open_verification_window_action = QAction("検証モードを開く...", self)
-        self.open_verification_window_action.triggered.connect(
-            self.open_verification_window
-        )
-        tools_menu.addAction(self.open_verification_window_action)
-
     def _wire_signals(self) -> None:
-        self.play_button.clicked.connect(self.video_widget.play)
+        self.open_gpx_button.clicked.connect(self.open_gpx_dialog)
+        self.open_video_button.clicked.connect(self.open_video_dialog)
+
+        self.play_button.clicked.connect(self.on_play_clicked)
         self.pause_button.clicked.connect(self.on_pause_clicked)
+        self.reverse_button.clicked.connect(self.on_reverse_clicked)
+        self.step_back_button.clicked.connect(self.on_step_back_clicked)
+        self.step_forward_button.clicked.connect(self.on_step_forward_clicked)
         self.export_button.clicked.connect(self.on_export_clicked)
 
         self.video_widget.position_changed.connect(self.on_position_changed)
@@ -149,33 +203,20 @@ class MainWindow(QMainWindow):
         self.timelapse_widget.timelapse_changed.connect(self.on_timelapse_changed)
 
     # ------------------------------------------------------------------
-    # Drag & drop（GPX未読み込み時は動画ファイルのドロップを拒否する）
+    # Drag & drop（GPX・動画とも読み込み順序を問わず受け付ける。22章）
     # ------------------------------------------------------------------
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if not event.mimeData().hasUrls():
             return
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith(".gpx"):
-                event.acceptProposedAction()
-                return
-            if self.state.gpx_data is not None:
-                event.acceptProposedAction()
-                return
+        event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path.lower().endswith(".gpx"):
                 self.load_gpx(path)
-            elif self.state.gpx_data is not None:
-                self.load_video(path)
             else:
-                QMessageBox.warning(
-                    self,
-                    "エラー",
-                    "先にGPXファイルを読み込んでください",
-                )
+                self.load_video(path)
 
     # ------------------------------------------------------------------
     # File loading
@@ -197,11 +238,6 @@ class MainWindow(QMainWindow):
         if path:
             self.load_video(path)
 
-    def open_verification_window(self) -> None:
-        window = VerificationWindow()
-        self._verification_windows.append(window)
-        window.show()
-
     def load_gpx(self, path: str) -> None:
         try:
             handler = GPXHandler.load(path)
@@ -218,20 +254,29 @@ class MainWindow(QMainWindow):
             )
             return
 
-        matched_points = self._run_map_matching(points)
-        handler.replace_points(matched_points)
+        result = self._run_map_matching(points)
+        handler.replace_points(result.points)
 
+        self._apply_gps_source(handler, gpx_path=path)
+        self._update_map_matching_status(result, total_points=len(points))
+
+    def _apply_gps_source(self, handler: GPXHandler, gpx_path: str) -> None:
+        """GPXデータを内部状態に反映する共通処理（22章）。GPXファイルの
+        明示読み込み・動画に埋め込まれたCAMM GPSトラックの抽出、
+        いずれの経路でも呼ばれる。最後に読み込んだGPS付きファイルが
+        常に優先される（最後勝ちルール）。"""
         self.gpx_handler = handler
-        self.state.gpx_path = path
+        self.state.gpx_path = gpx_path
         self.state.gpx_data = handler.gpx
 
         self.map_widget.load_gpx_route(
-            [(p.latitude, p.longitude) for p in matched_points]
+            [(p.latitude, p.longitude) for p in handler.get_all_points()]
         )
-        self.open_video_action.setEnabled(True)
         self._update_export_button_state()
+        self._update_open_button_emphasis()
+        self._update_route_range_highlight()
 
-    def _run_map_matching(self, points):
+    def _run_map_matching(self, points) -> GpxMatchResult:
         """GPX読み込み時のマップマッチング（5-9節）。ワーカーをバックグラウンド
         実行しつつ進捗ダイアログをモーダル表示し、完了まで待つ。"""
         worker = MapMatchingWorker(points, match_chunk_impl=self._match_chunk_impl)
@@ -246,16 +291,66 @@ class MainWindow(QMainWindow):
         dialog.exec()
         worker.wait()
 
-        return result_holder["result"].points
+        return result_holder["result"]
+
+    def _update_map_matching_status(self, result: GpxMatchResult, total_points: int) -> None:
+        """マップマッチング結果（16章）を左カードに常設表示する。タイムアウト等で
+        一部/全部の点が未処理のまま終わっていないかを一目で確認できるようにする。
+        match_route()のstatusは「エラー」でも実際にはチャンク処理自体は全て
+        成功し単にスナップ対象が無かっただけ、というケースがあるため（n_snapped==0
+        で確定するstatus文言）、成否の判定は result.error の有無を優先する。"""
+        if result.error is None:
+            state = "ok"
+            text = f"✓ マップマッチング完了（{total_points}点中{result.n_snapped}点をスナップ）"
+        elif result.status == "キャンセル":
+            state = "error"
+            text = "✗ マップマッチング中断（タイムアウトのため元座標のまま使用）"
+        else:
+            state = "warn"
+            text = (
+                f"⚠ マップマッチング一部失敗"
+                f"（{total_points}点中{result.n_snapped}点をスナップ）"
+            )
+
+        self._set_map_matching_status_label(text, state, tooltip=result.error or "")
+
+    def _update_gps_source_status_for_camm(self, point_count: int) -> None:
+        """動画に埋め込まれたCAMM GPSトラックをGPXデータとして採用した
+        際のステータス表示（22章）。マップマッチングは適用していない
+        （既に処理済みの実走行データのため）ため、
+        _update_map_matching_status()とは異なる文言で表示する。"""
+        text = f"✓ 動画に埋め込まれたGPSデータを使用（{point_count}点）"
+        self._set_map_matching_status_label(text, "ok")
+
+    def _set_map_matching_status_label(
+        self, text: str, state: str, tooltip: str = ""
+    ) -> None:
+        self.map_matching_status_label.setText(text)
+        self.map_matching_status_label.setToolTip(tooltip)
+        self.map_matching_status_label.setProperty("state", state)
+        self.map_matching_status_label.style().unpolish(self.map_matching_status_label)
+        self.map_matching_status_label.style().polish(self.map_matching_status_label)
+        self.map_matching_status_label.setVisible(True)
+
+    def _set_button_emphasis(self, button: QPushButton, emphasize: bool) -> None:
+        """未読み込み状態のOpenボタンをprimaryButton化して目立たせる
+        （17章）。objectName変更後はunpolish/polishでQSSを再適用する
+        必要があることを実機検証済み。"""
+        button.setObjectName("primaryButton" if emphasize else "")
+        button.style().unpolish(button)
+        button.style().polish(button)
+
+    def _update_open_button_emphasis(self) -> None:
+        """22章: GPX・動画は読み込み順序を問わないため、それぞれ独立に
+        「まだ読み込んでいなければ強調」を判定する（互いの読み込み状況
+        に依存しない）。"""
+        self._set_button_emphasis(self.open_gpx_button, self.state.gpx_data is None)
+        self._set_button_emphasis(
+            self.open_video_button, self.state.video_path is None
+        )
 
     def load_video(self, path: str) -> None:
-        if self.state.gpx_data is None:
-            QMessageBox.warning(
-                self,
-                "エラー",
-                "先にGPXファイルを読み込んでください",
-            )
-            return
+        self._stop_reverse_timer()
 
         try:
             creation_time_str = self.video_handler.get_creation_time(path)
@@ -282,6 +377,7 @@ class MainWindow(QMainWindow):
             self._video_fps = self.video_handler.get_fps(path)
         except FFmpegError:
             self._video_fps = None
+        self._update_frame_step_buttons_enabled()
 
         # 動画差し替え時はタイムラプス設定を初期状態に戻す
         # （reset()が発火するtimelapse_changedシグナル経由でstate/再生レートも同期される）
@@ -297,9 +393,40 @@ class MainWindow(QMainWindow):
             self.timelapse_widget.checkbox.setChecked(True)
             self.timelapse_widget.interval_spinbox.setValue(interval_sec)
 
+        self._try_load_embedded_gps(path)
+
         self.video_widget.load(path)
         self._apply_playback_rate()
         self._update_export_button_state()
+        self._update_open_button_emphasis()
+
+    def _try_load_embedded_gps(self, path: str) -> None:
+        """動画にCAMM形式のGPSトラックが埋め込まれている場合、それを
+        GPXデータとして採用する（23章。最後に読み込んだGPS付きファイル
+        が常に優先されるルール）。埋め込みが無い動画の場合は何もせず、
+        既存のGPXデータ（あれば）をそのまま維持する。マップマッチングは
+        適用しない（既に処理済みの実走行データのため）。"""
+        try:
+            camm_points = extract_gps_track(path)
+        except (CammTrackNotFoundError, CammEncodeError):
+            return
+        if not camm_points:
+            return
+
+        # MP4BoxでCAMMトラックを追加すると、動画コンテナのcreation_time
+        # メタデータが処理実行時刻で上書きされてしまうことが実機で判明
+        # している（4-8節「制約3」）。そのためffprobe由来の
+        # video_creation_timeは信用できず、CAMM自身の先頭サンプル
+        # （relative_msが最小、通常は0）のepoch_timeを真の動画開始
+        # 時刻として採用する（実機で発生した不具合の対応。23章）。
+        first_point = min(camm_points, key=lambda p: p[0])
+        self.state.video_creation_time = datetime.datetime.fromtimestamp(
+            first_point[4], tz=datetime.timezone.utc
+        )
+
+        handler = GPXHandler.from_camm_points(camm_points)
+        self._apply_gps_source(handler, gpx_path=path)
+        self._update_gps_source_status_for_camm(len(camm_points))
 
     @staticmethod
     def _parse_iso_utc(value: str) -> datetime.datetime:
@@ -309,8 +436,9 @@ class MainWindow(QMainWindow):
         return dt
 
     def _prompt_creation_time(self) -> datetime.datetime | None:
-        assert self.gpx_handler is not None
-        points = self.gpx_handler.get_all_points()
+        # 22章: GPXが動画より先に読み込まれているとは限らないため、
+        # gpx_handler未読み込みの場合は現在時刻をデフォルト値にする。
+        points = self.gpx_handler.get_all_points() if self.gpx_handler else []
         if points:
             default_local = points[0].time.astimezone()
         else:
@@ -321,6 +449,8 @@ class MainWindow(QMainWindow):
             "動画の録画開始時刻を入力"
         )
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
         layout.addWidget(
             QLabel(
                 "動画に作成日時が見つかりませんでした。\n"
@@ -356,6 +486,8 @@ class MainWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("動画の設定確認")
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
 
         if not has_audio:
             layout.addWidget(
@@ -417,6 +549,34 @@ class MainWindow(QMainWindow):
         self._apply_playback_rate()
         self.on_position_changed(self.video_widget.timeline.position_ms())
         self._update_export_button_state()
+        self._update_video_info_label(interval_sec)
+        self._update_route_range_highlight()
+
+    def _update_video_info_label(self, interval_sec: float) -> None:
+        """動画の素性（fps・タイムラプス設定）を右カードのヘッダー直下に
+        表示する（17章）。左カードのmap_matching_status_labelと同じ
+        位置に配置することで、左右カードの上下位置を揃えている。"""
+        if self.state.video_path is None:
+            self.video_info_label.setVisible(False)
+            return
+
+        if self._video_fps is None:
+            text = "fps不明"
+        else:
+            text = f"{self._video_fps:.2f}fps"
+            if self.state.video_time_scale != 1.0:
+                text += f"（{interval_sec:g}sタイムラプス）"
+
+        self.video_info_label.setText(text)
+        self.video_info_label.setVisible(True)
+
+    def _current_playback_rate(self) -> float:
+        """タイムラプス設定を反映した順再生の速度倍率。_apply_playback_rate()
+        （QMediaPlayer.setPlaybackRate()向け）と_on_reverse_tick()
+        （疑似逆再生の1ティックあたりの移動量計算向け）で共通利用する。"""
+        if self.state.video_time_scale == 1.0:
+            return 1.0
+        return 1.0 / self.state.video_time_scale
 
     def _apply_playback_rate(self) -> None:
         """タイムラプス有効時は、動画の再生速度をvideo_time_scaleの逆数に
@@ -424,7 +584,7 @@ class MainWindow(QMainWindow):
         （例: 0.5秒間隔・29.97fps → 見かけ上2fps相当）。音声は無意味な
         速度になるためミュートする。"""
         if self.state.video_time_scale != 1.0:
-            self.video_widget.player.setPlaybackRate(1.0 / self.state.video_time_scale)
+            self.video_widget.player.setPlaybackRate(self._current_playback_rate())
             self.video_widget.audio_output.setMuted(True)
         else:
             self.video_widget.player.setPlaybackRate(1.0)
@@ -435,19 +595,39 @@ class MainWindow(QMainWindow):
         self.state.video_start_ms = self.video_widget.timeline.start_ms()
         self.state.video_end_ms = self.video_widget.timeline.end_ms()
         self._update_export_button_state()
+        self._update_route_range_highlight()
 
     def on_start_changed(self, ms: int) -> None:
         self.state.video_start_ms = ms
         self._update_export_button_state()
+        self._update_route_range_highlight()
 
     def on_end_changed(self, ms: int) -> None:
         self.state.video_end_ms = ms
         self._update_export_button_state()
+        self._update_route_range_highlight()
 
     def on_offset_changed(self, seconds: float) -> None:
         self.state.offset_seconds = seconds
         self.on_position_changed(self.video_widget.timeline.position_ms())
         self._update_export_button_state()
+        self._update_route_range_highlight()
+
+    def _update_route_range_highlight(self) -> None:
+        """マップ上のGPXルート線を、動画のStart/End出力範囲に応じて
+        2色に塗り分ける（クロップされる領域の可視化）。GPX・動画の
+        いずれかが未読み込みの場合は何もしない（loadRoute()実行前は
+        マップ側にルートが存在しないため）。"""
+        if self.gpx_handler is None or self.state.video_creation_time is None:
+            return
+        in_range = self.gpx_handler.classify_points_in_range(
+            self.state.video_start_ms,
+            self.state.video_end_ms,
+            self.state.offset_seconds,
+            self.state.video_creation_time,
+            self.state.video_time_scale,
+        )
+        self.map_widget.update_route_ranges(in_range)
 
     def on_force_sync_clicked(self) -> None:
         """GPXデータ先頭とタイムラインのStartマーカー位置の時刻を
@@ -456,7 +636,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "エラー",
-                "先に動画を読み込んでください",
+                "先にGPXファイルと動画の両方を読み込んでください",
             )
             return
 
@@ -470,8 +650,56 @@ class MainWindow(QMainWindow):
         offset_sec = (gpx_start_time - video_start_true_time).total_seconds()
         self.offset_widget.set_offset(offset_sec)
 
+    def on_play_clicked(self) -> None:
+        self._stop_reverse_timer()
+        self.video_widget.play()
+
     def on_pause_clicked(self) -> None:
+        self._stop_reverse_timer()
         self.video_widget.pause()
+
+    def on_reverse_clicked(self) -> None:
+        """逆再生（18章）。QMediaPlayer.setPlaybackRate()は負値を受け付けず
+        実機で0倍速に丸められてしまう（実機検証済み）ため、ネイティブな
+        逆再生機能は使わず、タイマーで再生位置を少しずつ巻き戻すことで
+        疑似的に実現する。"""
+        self.video_widget.pause()
+        self._reverse_timer.start()
+
+    def _stop_reverse_timer(self) -> None:
+        self._reverse_timer.stop()
+
+    def _on_reverse_tick(self) -> None:
+        step_ms = round(REVERSE_TICK_MS * self._current_playback_rate())
+        start_ms = self.video_widget.timeline.start_ms()
+        new_pos = self.video_widget.player.position() - step_ms
+        if new_pos <= start_ms:
+            self.video_widget.player.setPosition(start_ms)
+            self._stop_reverse_timer()
+        else:
+            self.video_widget.player.setPosition(new_pos)
+
+    def on_step_back_clicked(self) -> None:
+        self._step_frame(-1)
+
+    def on_step_forward_clicked(self) -> None:
+        self._step_frame(1)
+
+    def _step_frame(self, direction: int) -> None:
+        """コマ送り・コマ戻り（18章）。1フレーム分のミリ秒数は動画自身の
+        fpsから算出する（video_time_scaleによらず、常にネイティブな
+        動画ファイル上の1フレーム分移動する）。"""
+        if self._video_fps is None or self._video_fps <= 0:
+            return
+        self._stop_reverse_timer()
+        self.video_widget.pause()
+        frame_ms = round(1000 / self._video_fps)
+        self.video_widget.seek(self.video_widget.player.position() + direction * frame_ms)
+
+    def _update_frame_step_buttons_enabled(self) -> None:
+        enabled = self._video_fps is not None and self._video_fps > 0
+        self.step_back_button.setEnabled(enabled)
+        self.step_forward_button.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Export
@@ -479,15 +707,64 @@ class MainWindow(QMainWindow):
     def _update_export_button_state(self) -> None:
         self.export_button.setEnabled(self.exporter.can_export(self.state))
 
-    def on_export_clicked(self) -> None:
-        output_dir = QFileDialog.getExistingDirectory(
-            self, "出力先を選択"
+    def _confirm_and_apply_gps_coverage_crop(self) -> bool:
+        """出力直前、GPXの記録範囲がStart-End全体を完全にカバーして
+        いるか確認する。カバーされていない区間がある場合（20章の
+        ルート塗り分けでグレー表示される区間に相当）、そのまま出力すると
+        一部フレームがGPSデータ無しになる（mapillary_tools側で外挿で
+        補われるが実測ではない）ため、確認ダイアログを表示する。
+        OKされた場合はStart/EndをGPXの記録範囲にクロップしてから
+        Trueを返す。キャンセルされた場合はFalseを返し、呼び出し元
+        （on_export_clicked）で出力処理自体を中断させる。"""
+        if self.gpx_handler is None or self.state.video_creation_time is None:
+            return True
+
+        clipped_start, clipped_end = self.gpx_handler.clip_to_gps_coverage(
+            self.state.video_start_ms,
+            self.state.video_end_ms,
+            self.state.offset_seconds,
+            self.state.video_creation_time,
+            self.state.video_time_scale,
         )
-        if not output_dir:
+        if (
+            clipped_start == self.state.video_start_ms
+            and clipped_end == self.state.video_end_ms
+        ):
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            "GPSデータの範囲確認",
+            "GPSデータのない動画フレームが存在するため、"
+            "動画をクロップします。よろしいですか？",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+        if reply != QMessageBox.StandardButton.Ok:
+            return False
+
+        self.video_widget.timeline.set_start(clipped_start)
+        self.on_start_changed(clipped_start)
+        self.video_widget.timeline.set_end(clipped_end)
+        self.on_end_changed(clipped_end)
+        self.video_widget.seek(self.video_widget.player.position())
+        return True
+
+    def on_export_clicked(self) -> None:
+        if not self._confirm_and_apply_gps_coverage_crop():
+            return
+
+        video_output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "動画の保存先を選択",
+            self.exporter.default_video_filename(self.state),
+            "MP4 Files (*.mp4)",
+        )
+        if not video_output_path:
             return
 
         try:
-            video_path, gpx_path = self.exporter.export(self.state, output_dir)
+            video_path, gpx_path = self.exporter.export(self.state, video_output_path)
         except Exception as exc:  # noqa: BLE001 - ユーザーへの通知が目的
             QMessageBox.warning(self, "出力エラー", str(exc))
             return
@@ -546,8 +823,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 - Qtの命名規則に合わせる
+        self._stop_reverse_timer()
         self.video_widget.player.stop()
         self.video_widget.player.setSource(QUrl())
-        for window in self._verification_windows:
-            window.close()
         super().closeEvent(event)

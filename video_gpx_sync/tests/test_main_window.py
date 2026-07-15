@@ -1,18 +1,22 @@
 import datetime
 import os
+import shutil
 
 import pytest
 from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import QCheckBox, QDialog, QDoubleSpinBox, QLabel
 
+from app.camm_encoder import embed_gps_track
 from app.main_window import MainWindow
 from app.mapillary_validator import ValidationResult
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 SAMPLE_MP4 = os.path.join(FIXTURES_DIR, "sample.mp4")
+SAMPLE_420P_MP4 = os.path.join(FIXTURES_DIR, "sample_420p.mp4")
 SAMPLE_GPX = os.path.join(FIXTURES_DIR, "sample.gpx")
 
 UTC = datetime.timezone.utc
+MP4BOX_AVAILABLE = shutil.which("MP4Box") is not None
 
 
 def _fake_match_chunk(chunk):
@@ -43,22 +47,217 @@ def window(qtbot):
     qtbot.wait(200)
 
 
-def test_initial_state_disables_video_loading_and_export(window: MainWindow) -> None:
-    assert window.open_video_action.isEnabled() is False
+@pytest.fixture
+def camm_embedded_video(tmp_path) -> str:
+    """CAMM Type6のGPSトラックを埋め込んだ動画ファイル（22章）。
+    sample_420p.mp4はMP4Boxでのnhml埋め込みに対応したフィクスチャ
+    （test_camm_encoder.pyと共通）。"""
+    output_path = str(tmp_path / "embedded.mp4")
+    t0 = datetime.datetime(2026, 7, 12, 1, 0, 0, tzinfo=UTC)
+    points = [
+        (0, 35.5000, 136.0000, 20.0, t0.timestamp()),
+        (
+            5000,
+            35.5010,
+            136.0010,
+            21.0,
+            (t0 + datetime.timedelta(seconds=5)).timestamp(),
+        ),
+    ]
+    embed_gps_track(SAMPLE_420P_MP4, output_path, points)
+    return output_path
+
+
+def test_initial_state_disables_export_only(window: MainWindow) -> None:
+    # 22章: 読み込み順序ルール撤廃により、動画読み込みはGPXの
+    # 読み込み状況に関わらず常に可能。出力のみ両方揃うまで無効。
+    assert window.open_video_action.isEnabled() is True
     assert window.export_button.isEnabled() is False
 
 
-def test_load_video_without_gpx_shows_warning_and_is_ignored(
+def test_initial_state_emphasizes_both_open_buttons(window: MainWindow) -> None:
+    # 22章: GPX・動画のいずれも未読み込みの間は、両方とも独立に
+    # 強調表示する（互いの読み込み状況に依存しない）。
+    assert window.open_gpx_button.objectName() == "primaryButton"
+    assert window.open_video_button.objectName() == "primaryButton"
+    assert window.open_video_button.isEnabled() is True
+
+
+def test_load_gpx_shifts_emphasis_to_open_video_button(window: MainWindow) -> None:
+    window.load_gpx(SAMPLE_GPX)
+
+    assert window.open_gpx_button.objectName() == ""
+    assert window.open_video_button.objectName() == "primaryButton"
+    assert window.open_video_button.isEnabled() is True
+
+
+def test_load_video_clears_open_video_button_emphasis(
+    window: MainWindow, qtbot
+) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    assert window.open_video_button.objectName() == ""
+
+
+def test_load_gpx_shows_success_map_matching_status(window: MainWindow) -> None:
+    window.load_gpx(SAMPLE_GPX)
+
+    # ウィンドウ自体をshow()していないテストではisVisible()は常にFalseに
+    # なるため、ウィジェット自身の明示的な非表示フラグを見るisHidden()を使う。
+    assert window.map_matching_status_label.isHidden() is False
+    assert window.map_matching_status_label.property("state") == "ok"
+    assert "完了" in window.map_matching_status_label.text()
+
+
+def test_load_gpx_shows_warn_status_on_partial_chunk_failure(
     window: MainWindow, monkeypatch
 ) -> None:
-    warned = {}
-    monkeypatch.setattr(
-        "app.main_window.QMessageBox.warning",
-        lambda *a, **k: warned.setdefault("called", True),
+    # GPXフィクスチャは1チャンクに収まる点数のため、CHUNK_SIZEを1に
+    # 下げて複数チャンクに分割させ、2チャンク目のみ失敗させる。
+    monkeypatch.setattr("app.map_matcher.CHUNK_SIZE", 1)
+    call_count = {"n": 0}
+
+    def flaky_match_chunk(chunk):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("boom")
+        return {
+            "matched_points": [
+                {"lat": lat, "lon": lon, "type": "matched"} for lat, lon in chunk
+            ]
+        }
+
+    window._match_chunk_impl = flaky_match_chunk
+    window.load_gpx(SAMPLE_GPX)
+
+    assert window.map_matching_status_label.property("state") == "warn"
+    assert "一部失敗" in window.map_matching_status_label.text()
+
+
+def test_load_gpx_shows_error_status_when_first_chunk_times_out(
+    window: MainWindow,
+) -> None:
+    def failing_match_chunk(chunk):
+        raise RuntimeError("timeout")
+
+    window._match_chunk_impl = failing_match_chunk
+    window.load_gpx(SAMPLE_GPX)
+
+    assert window.map_matching_status_label.property("state") == "error"
+    assert "中断" in window.map_matching_status_label.text()
+
+
+def test_load_video_without_gpx_succeeds(window: MainWindow, qtbot) -> None:
+    # 22章: GPX先読み込みルールを撤廃したため、GPX未読み込みの状態でも
+    # 動画は問題なく読み込める（CAMM埋め込みが無いsample.mp4のため
+    # GPXデータは引き続きNoneのまま）。
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    assert window.state.video_path == SAMPLE_MP4
+    assert window.state.gpx_data is None
+
+
+@pytest.mark.skipif(not MP4BOX_AVAILABLE, reason="MP4Box not installed")
+def test_load_video_with_embedded_gps_auto_populates_gpx_data(
+    window: MainWindow, qtbot, camm_embedded_video: str
+) -> None:
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(camm_embedded_video)
+
+    assert window.state.gpx_data is not None
+    assert window.gpx_handler is not None
+    assert len(window.gpx_handler.get_all_points()) == 2
+    assert window.state.gpx_path == camm_embedded_video
+    assert window.map_matching_status_label.property("state") == "ok"
+    assert "動画に埋め込まれたGPSデータを使用" in window.map_matching_status_label.text()
+
+
+@pytest.mark.skipif(not MP4BOX_AVAILABLE, reason="MP4Box not installed")
+def test_camm_video_creation_time_uses_embedded_epoch_not_corrupted_metadata(
+    window: MainWindow, qtbot, camm_embedded_video: str
+) -> None:
+    # MP4BoxでCAMMトラックを追加すると、動画コンテナのcreation_time
+    # メタデータが処理実行時刻（＝実機ではテスト実行時の現在時刻）で
+    # 上書きされてしまうことが実機で判明した（4-8節「制約3」）。
+    # ffprobe由来の値を信用すると、地図上のルートが全区間グレー表示
+    # （範囲外）になり、マーカーも一切動かなくなる不具合が発生する。
+    # CAMM自身のepoch_timeを真の開始時刻として採用することで回避
+    # できていることを確認する（回帰テスト。23章）。
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(camm_embedded_video)
+
+    assert window.state.video_creation_time == datetime.datetime(
+        2026, 7, 12, 1, 0, 0, tzinfo=UTC
     )
-    window.load_video(SAMPLE_MP4)
-    assert warned.get("called") is True
-    assert window.state.video_path is None
+
+    in_range = window.gpx_handler.classify_points_in_range(
+        window.state.video_start_ms,
+        window.state.video_end_ms,
+        window.state.offset_seconds,
+        window.state.video_creation_time,
+        window.state.video_time_scale,
+    )
+    assert all(in_range)
+
+    pos = window.gpx_handler.interpolate_position(
+        2500,
+        window.state.offset_seconds,
+        window.state.video_creation_time,
+        window.state.video_time_scale,
+    )
+    assert pos is not None
+
+
+@pytest.mark.skipif(not MP4BOX_AVAILABLE, reason="MP4Box not installed")
+def test_loading_video_without_camm_keeps_existing_gpx(
+    window: MainWindow, qtbot
+) -> None:
+    # 最後勝ちルール（22章）: CAMM埋め込みが無い動画を読み込んでも
+    # 既存のGPXデータは維持される（新しいGPS情報が無いため上書きしない）
+    window.load_gpx(SAMPLE_GPX)
+    original_gpx_data = window.state.gpx_data
+
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)  # CAMM埋め込みなし
+
+    assert window.state.gpx_data is original_gpx_data
+
+
+@pytest.mark.skipif(not MP4BOX_AVAILABLE, reason="MP4Box not installed")
+def test_camm_video_loaded_after_gpx_overrides_it(
+    window: MainWindow, qtbot, camm_embedded_video: str
+) -> None:
+    # 最後勝ちルール（22章）: GPX読み込み後にCAMM埋め込み動画を読み込むと
+    # そちらのGPSデータが優先される
+    window.load_gpx(SAMPLE_GPX)
+    gpx_point_count = len(window.gpx_handler.get_all_points())
+
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(camm_embedded_video)
+
+    assert len(window.gpx_handler.get_all_points()) == 2
+    assert len(window.gpx_handler.get_all_points()) != gpx_point_count
+    assert window.state.gpx_path == camm_embedded_video
+
+
+@pytest.mark.skipif(not MP4BOX_AVAILABLE, reason="MP4Box not installed")
+def test_gpx_loaded_after_camm_video_overrides_it(
+    window: MainWindow, qtbot, camm_embedded_video: str
+) -> None:
+    # 最後勝ちルール（22章）: CAMM埋め込み動画読み込み後にGPXファイルを
+    # 読み込むと、そちらが優先される（マップマッチングも通常通り適用）
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(camm_embedded_video)
+    assert len(window.gpx_handler.get_all_points()) == 2
+
+    window.load_gpx(SAMPLE_GPX)
+
+    assert window.state.gpx_path == SAMPLE_GPX
+    assert window.map_matching_status_label.property("state") == "ok"
+    assert "完了" in window.map_matching_status_label.text()
 
 
 def test_load_gpx_enables_video_loading(window: MainWindow, qtbot) -> None:
@@ -105,6 +304,42 @@ def test_load_video_after_gpx_sets_state_and_enables_export(
     assert window.export_button.isEnabled() is True
 
 
+def test_load_video_shows_fps_in_video_info_label(window: MainWindow, qtbot) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    # sample.mp4はffprobeでr_frame_rate=30/1と確認済み
+    assert window.video_info_label.isHidden() is False
+    assert window.video_info_label.text() == "30.00fps"
+    assert "タイムラプス" not in window.video_info_label.text()
+
+
+def test_load_video_with_timelapse_shows_interval_in_video_info_label(
+    window: MainWindow, qtbot
+) -> None:
+    window._prompt_timelapse_settings = lambda has_audio: (True, 0.5)
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    assert window.video_info_label.text() == "30.00fps（0.5sタイムラプス）"
+
+
+def test_toggling_persistent_timelapse_widget_updates_video_info_label(
+    window: MainWindow, qtbot
+) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+    assert window.video_info_label.text() == "30.00fps"
+
+    window.timelapse_widget.checkbox.setChecked(True)
+    window.timelapse_widget.interval_spinbox.setValue(1.0)
+
+    assert window.video_info_label.text() == "30.00fps（1sタイムラプス）"
+
+
 def test_offset_change_updates_state_and_marker(
     window: MainWindow, qtbot, monkeypatch
 ) -> None:
@@ -128,6 +363,30 @@ def test_offset_change_updates_state_and_marker(
     assert calls == ["update"]
 
 
+def test_end_change_updates_route_range_highlight(
+    window: MainWindow, qtbot, monkeypatch
+) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    calls = []
+    monkeypatch.setattr(
+        window.map_widget,
+        "update_route_ranges",
+        lambda in_range: calls.append(in_range),
+    )
+
+    # sample.gpxの記録点: 01:00:00, 01:00:05, 01:00:10
+    # video_creation_time=01:00:00なので、end=6000ms(01:00:06)にすると
+    # 3点目(01:00:10)だけが範囲外になる
+    # on_end_changed()はCustomTimeline.end_changedシグナル経由で呼ばれる
+    # メソッドのため、ここでは直接呼んでハンドラの挙動を検証する。
+    window.on_end_changed(6000)
+
+    assert calls[-1] == [True, True, False]
+
+
 def test_pause_button_pauses_without_seeking(window: MainWindow, qtbot) -> None:
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
@@ -146,6 +405,102 @@ def test_pause_button_pauses_without_seeking(window: MainWindow, qtbot) -> None:
     )
 
 
+def test_step_forward_moves_by_exactly_one_frame(window: MainWindow, qtbot) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    # sample.mp4はffprobeでfps=30と確認済み -> 1フレーム = 約33ms
+    assert window._video_fps == pytest.approx(30.0, abs=0.5)
+    window.video_widget.player.setPosition(5000)
+
+    window.on_step_forward_clicked()
+
+    assert window.video_widget.player.position() == 5000 + round(1000 / window._video_fps)
+
+
+def test_step_back_moves_by_exactly_one_frame(window: MainWindow, qtbot) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    window.video_widget.player.setPosition(5000)
+
+    window.on_step_back_clicked()
+
+    assert window.video_widget.player.position() == 5000 - round(1000 / window._video_fps)
+
+
+def test_step_forward_clamps_to_end_marker(window: MainWindow, qtbot) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    window.video_widget.timeline.set_end(6000)
+    window.video_widget.player.setPosition(5990)
+
+    window.on_step_forward_clicked()
+
+    assert window.video_widget.player.position() == 6000
+
+
+def test_frame_step_buttons_disabled_when_fps_unknown(
+    window: MainWindow, qtbot, monkeypatch
+) -> None:
+    from app.video_handler import FFmpegError
+
+    monkeypatch.setattr(
+        window.video_handler,
+        "get_fps",
+        lambda path: (_ for _ in ()).throw(FFmpegError("fps unknown")),
+    )
+
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    assert window._video_fps is None
+    assert window.step_back_button.isEnabled() is False
+    assert window.step_forward_button.isEnabled() is False
+
+
+def test_reverse_playback_decrements_position_and_stops_at_start(
+    window: MainWindow, qtbot
+) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    window.video_widget.timeline.set_start(1000)
+    window.video_widget.player.setPosition(1150)
+
+    window.on_reverse_clicked()
+    assert window._reverse_timer.isActive() is True
+
+    # 実タイマー待ちにせず、ティック処理を直接複数回呼んで決定的に検証する
+    for _ in range(10):
+        window._on_reverse_tick()
+
+    assert window.video_widget.player.position() == 1000
+    assert window._reverse_timer.isActive() is False
+
+
+def test_play_and_pause_stop_reverse_timer(window: MainWindow, qtbot) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    window._reverse_timer.start()
+    assert window._reverse_timer.isActive() is True
+    window.on_pause_clicked()
+    assert window._reverse_timer.isActive() is False
+
+    window._reverse_timer.start()
+    assert window._reverse_timer.isActive() is True
+    window.on_play_clicked()
+    assert window._reverse_timer.isActive() is False
+
+
 def test_export_button_disabled_when_ranges_do_not_overlap(
     window: MainWindow, qtbot
 ) -> None:
@@ -160,6 +515,69 @@ def test_export_button_disabled_when_ranges_do_not_overlap(
     assert window.export_button.isEnabled() is False
 
 
+def test_export_confirm_not_shown_when_gps_fully_covers_range(
+    window: MainWindow, qtbot, monkeypatch
+) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        "app.main_window.QMessageBox.question",
+        lambda *a, **k: called.update(n=called["n"] + 1),
+    )
+
+    assert window._confirm_and_apply_gps_coverage_crop() is True
+    assert called["n"] == 0
+    assert window.state.video_start_ms == 0
+    assert window.state.video_end_ms == 10000
+
+
+def test_export_confirm_crops_start_when_accepted(
+    window: MainWindow, qtbot, monkeypatch
+) -> None:
+    from PyQt6.QtWidgets import QMessageBox
+
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    # sample.gpxの記録開始(01:00:00)より前にraw_startがずれるようにする
+    window.on_offset_changed(-3.0)
+
+    monkeypatch.setattr(
+        "app.main_window.QMessageBox.question",
+        lambda *a, **k: QMessageBox.StandardButton.Ok,
+    )
+
+    assert window._confirm_and_apply_gps_coverage_crop() is True
+    assert window.state.video_start_ms == 3000
+    assert window.state.video_end_ms == 10000
+    assert window.video_widget.timeline.start_ms() == 3000
+
+
+def test_export_confirm_cancelled_leaves_state_unchanged(
+    window: MainWindow, qtbot, monkeypatch
+) -> None:
+    from PyQt6.QtWidgets import QMessageBox
+
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    window.on_offset_changed(-3.0)
+
+    monkeypatch.setattr(
+        "app.main_window.QMessageBox.question",
+        lambda *a, **k: QMessageBox.StandardButton.Cancel,
+    )
+
+    assert window._confirm_and_apply_gps_coverage_crop() is False
+    assert window.state.video_start_ms == 0
+    assert window.state.video_end_ms == 10000
+
+
 def test_export_creates_output_files(window: MainWindow, qtbot, tmp_path) -> None:
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
@@ -167,14 +585,43 @@ def test_export_creates_output_files(window: MainWindow, qtbot, tmp_path) -> Non
 
     assert window.export_button.isEnabled() is True
 
-    video_path, gpx_path = window.exporter.export(window.state, str(tmp_path))
+    video_output_path = str(tmp_path / window.exporter.default_video_filename(window.state))
+    video_path, gpx_path = window.exporter.export(window.state, video_output_path)
 
     assert os.path.exists(video_path)
     assert os.path.exists(gpx_path)
 
 
+def test_on_export_clicked_shows_save_dialog_with_default_filename(
+    window: MainWindow, qtbot, monkeypatch
+) -> None:
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    save_dialog_calls = []
+
+    def fake_get_save_file_name(parent, caption, default_name, filter_str):
+        save_dialog_calls.append((caption, default_name, filter_str))
+        return "", ""  # ユーザーがキャンセルした状態を模す
+
+    monkeypatch.setattr(
+        "app.main_window.QFileDialog.getSaveFileName", fake_get_save_file_name
+    )
+
+    window.on_export_clicked()
+
+    assert len(save_dialog_calls) == 1
+    _caption, default_name, filter_str = save_dialog_calls[0]
+    assert default_name == window.exporter.default_video_filename(window.state)
+    assert "*.mp4" in filter_str
+
+
 def test_export_button_label_is_export_and_test(window: MainWindow) -> None:
-    assert window.export_button.text() == "\U0001f4e4 Export & Test"
+    # QPushButtonのtext()は生の文字列("&&")を返す（表示上は"&"1文字になる）。
+    # "&"を単体で含めるとQtがニーモニック記号として解釈してしまうため、
+    # ボタン生成時は"&&"でエスケープしている（app/main_window.py参照）。
+    assert window.export_button.text() == "\U0001f4e4 Export && Test"
 
 
 def test_validate_export_skipped_when_mapillary_tools_unavailable(
@@ -224,25 +671,6 @@ def test_format_validation_message_variants(window: MainWindow) -> None:
     warn_result = ValidationResult(ok=True, n_images=2, errors=[], warnings=["w1", "w2"])
     warn_message = window._format_validation_message(warn_result)
     assert "警告 2件" in warn_message
-
-
-def test_open_verification_window_creates_independent_window(
-    window: MainWindow, qtbot
-) -> None:
-    window.load_gpx(SAMPLE_GPX)
-
-    window.open_verification_window()
-
-    assert len(window._verification_windows) == 1
-    verification_window = window._verification_windows[0]
-    qtbot.addWidget(verification_window)
-    assert verification_window.isVisible()
-    # MainWindowのステートには一切影響しない
-    assert window.state.gpx_data is not None
-
-    verification_window.video_widget.player.stop()
-    verification_window.video_widget.player.setSource(QUrl())
-    qtbot.wait(200)
 
 
 def test_force_sync_computes_offset_from_gpx_start_to_video_start_marker(

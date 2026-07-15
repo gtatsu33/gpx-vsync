@@ -50,6 +50,11 @@ class MapWidget(QWebEngineView):
         latlngs = [[lat, lon] for lat, lon in points]
         self._run_js(f"loadRoute({json.dumps(latlngs)});")
 
+    def update_route_ranges(self, in_range: list[bool]) -> None:
+        """load_gpx_route()で描画済みのルートを、動画のStart/End出力範囲
+        （in_range）に応じて2色に塗り分ける（クロップされる領域の可視化）。"""
+        self._run_js(f"updateRouteRanges({json.dumps(in_range)});")
+
     def update_marker(self, lat: float, lon: float) -> None:
         self._run_js(f"updateMarker({lat}, {lon});")
 

@@ -58,13 +58,15 @@ def test_calls_run_immediately_when_ready(widget, monkeypatch) -> None:
     widget._is_ready = True
 
     widget.load_gpx_route([(35.0, 135.0), (35.001, 135.001)])
+    widget.update_route_ranges([True, False])
     widget.hide_marker()
     widget.clear()
 
     expected_latlngs = json.dumps([[35.0, 135.0], [35.001, 135.001]])
     assert calls[0] == f"loadRoute({expected_latlngs});"
-    assert calls[1] == "hideMarker();"
-    assert calls[2] == "clearMap();"
+    assert calls[1] == "updateRouteRanges([true, false]);"
+    assert calls[2] == "hideMarker();"
+    assert calls[3] == "clearMap();"
 
 
 def test_load_finished_false_does_not_mark_ready(widget) -> None:

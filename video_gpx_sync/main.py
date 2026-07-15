@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
 from app.main_window import MainWindow  # noqa: E402 - 上記属性設定より後に読み込む必要がある
+from app.theme import apply_theme  # noqa: E402
 
 
 def check_ffmpeg_available() -> bool:
@@ -43,6 +44,7 @@ def show_mp4box_missing_dialog() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    apply_theme(app)
 
     if not check_ffmpeg_available():
         show_ffmpeg_missing_dialog()

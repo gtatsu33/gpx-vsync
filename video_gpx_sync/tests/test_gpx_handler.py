@@ -64,6 +64,27 @@ def test_get_all_points_sorted_across_tracks(handler: GPXHandler) -> None:
     assert points[-1].latitude == pytest.approx(35.0010)
 
 
+def test_from_camm_points_builds_sorted_handler_with_epoch_times() -> None:
+    # relative_msの順序はわざと崩し、epoch_time側でソートされることを検証する
+    camm_points = [
+        (2000, 35.0020, 135.0020, 12.0, 1783818004.0),
+        (0, 35.0000, 135.0000, 10.0, 1783818000.0),
+        (1000, 35.0010, 135.0010, 11.0, 1783818002.0),
+    ]
+    handler = GPXHandler.from_camm_points(camm_points)
+    points = handler.get_all_points()
+
+    assert len(points) == 3
+    assert [p.time.timestamp() for p in points] == [
+        1783818000.0,
+        1783818002.0,
+        1783818004.0,
+    ]
+    assert points[0].latitude == pytest.approx(35.0000)
+    assert points[0].elevation == pytest.approx(10.0)
+    assert points[0].time.tzinfo is not None
+
+
 def test_interpolate_position_linear(
     handler: GPXHandler, video_creation_time: datetime.datetime
 ) -> None:
@@ -118,6 +139,82 @@ def test_has_overlap(
     assert handler.has_overlap(1000, 5000, 0.0, video_creation_time) is True
     # 記録範囲(01:00:00-01:00:06)よりずっと後ろにオフセットでずらすと重複しない
     assert handler.has_overlap(1000, 5000, 100.0, video_creation_time) is False
+
+
+def test_classify_points_in_range(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    # 記録範囲: 01:00:00, 01:00:02, 01:00:04, 01:00:06
+    # video_start_ms=1000/video_end_ms=5000 -> raw_time_range = 01:00:01〜01:00:05
+    in_range = handler.classify_points_in_range(1000, 5000, 0.0, video_creation_time)
+    assert in_range == [False, True, True, False]
+
+
+def test_classify_points_in_range_respects_offset_and_time_scale(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    # offset_sec=+2: raw_time_range = (0+2)〜(4000ms+2s) = 01:00:02〜01:00:06
+    in_range = handler.classify_points_in_range(
+        0, 4000, 2.0, video_creation_time
+    )
+    assert in_range == [False, True, True, True]
+
+    # time_scale=2.0: video_start_ms=0(実世界0s)〜video_end_ms=2000(実世界4s)
+    # -> raw_time_range = 01:00:00〜01:00:04
+    in_range_scaled = handler.classify_points_in_range(
+        0, 2000, 0.0, video_creation_time, video_time_scale=2.0
+    )
+    assert in_range_scaled == [True, True, True, False]
+
+
+def test_clip_to_gps_coverage_no_change_when_fully_covered(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    # 記録範囲(01:00:00-01:00:06)に完全に収まっている
+    start_ms, end_ms = handler.clip_to_gps_coverage(2000, 4000, 0.0, video_creation_time)
+    assert (start_ms, end_ms) == (2000, 4000)
+
+
+def test_clip_to_gps_coverage_clips_start_only(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    # video_start_ms=-3000 -> raw_start=00:59:57、記録開始(01:00:00)より前
+    start_ms, end_ms = handler.clip_to_gps_coverage(-3000, 4000, 0.0, video_creation_time)
+    assert start_ms == 0  # 記録開始時刻(01:00:00)に対応するms
+    assert end_ms == 4000  # endは記録範囲内なので変化しない
+
+
+def test_clip_to_gps_coverage_clips_end_only(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    # video_end_ms=9000 -> raw_end=01:00:09、記録終了(01:00:06)より後
+    start_ms, end_ms = handler.clip_to_gps_coverage(2000, 9000, 0.0, video_creation_time)
+    assert start_ms == 2000
+    assert end_ms == 6000  # 記録終了時刻(01:00:06)に対応するms
+
+
+def test_clip_to_gps_coverage_clips_both_ends(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    start_ms, end_ms = handler.clip_to_gps_coverage(-3000, 9000, 0.0, video_creation_time)
+    assert (start_ms, end_ms) == (0, 6000)
+
+
+def test_clip_to_gps_coverage_respects_offset(
+    handler: GPXHandler, video_creation_time: datetime.datetime
+) -> None:
+    # 動画がGPX記録開始の3秒後から始まっている(video_creation_time=t0+3s)状態で
+    # offset=-5秒をかけると、video_start_ms=0の時点のraw_timeは
+    # (t0+3s)+0-5s=t0-2s となり、記録開始(t0)より前になる
+    later_creation_time = video_creation_time + datetime.timedelta(seconds=3)
+    start_ms, end_ms = handler.clip_to_gps_coverage(
+        0, 6000, -5.0, later_creation_time
+    )
+    # クロップ後のstart_msに対応するraw_timeがちょうど記録開始(t0)になるはず
+    # raw_time = later_creation_time + start_ms(real) - 5s = t0
+    # -> start_ms(real) = t0 - later_creation_time + 5s = -3s + 5s = 2s = 2000ms
+    assert start_ms == 2000
+    assert end_ms == 6000
 
 
 def test_export_trimmed_interpolates_boundaries(

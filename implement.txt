@@ -1,6 +1,6 @@
 ================================================================
   Video-GPX Sync Tool - 実装仕様書
-  版数: 1.6  作成日: 2026-07-12（初版）  更新日: 2026-07-13
+  版数: 2.1  作成日: 2026-07-12（初版）  更新日: 2026-07-15
   実装方式: Python 3.11+ / PyQt6
 ================================================================
 
@@ -98,6 +98,7 @@
   │   ├── __init__.py
   │   ├── state.py          # AppState: アプリケーション状態のデータクラス
   │   ├── main_window.py    # QMainWindow: 全体レイアウト管理
+  │   ├── theme.py          # 配色パレット・QSS定義、ライト/ダーク自動切替（16章）
   │   ├── map_widget.py     # QWebEngineView ラッパー + Leaflet連携
   │   ├── video_widget.py   # QMediaPlayer + QVideoWidget + タイムライン
   │   ├── offset_widget.py  # GPSオフセット調整ボタン群
@@ -107,7 +108,6 @@
   │   ├── video_handler.py  # ffmpeg subprocess呼び出し、メタデータ取得
   │   ├── camm_encoder.py   # GPAC/MP4Box経由でCAMM GPSトラックの埋め込み・読み出し
   │   ├── exporter.py       # 動画・GPX出力処理
-  │   ├── verification_window.py  # 出力動画のGPS埋め込み検証用の独立ウィンドウ
   │   ├── map_matcher.py    # Valhalla APIでのマップマッチング、fair-use対応レート制限（13章）
   │   ├── map_matching_worker.py  # QThreadでmap_matcher処理をバックグラウンド実行
   │   ├── map_matching_dialog.py  # マップマッチング進捗ダイアログ（プログレスバー＋キャンセル）
@@ -115,7 +115,9 @@
   │   ├── mapillary_validation_worker.py  # QThreadでmapillary_validator処理をバックグラウンド実行
   │   └── mapillary_validation_dialog.py  # ローカル検証中ダイアログ（不定形インジケーター＋キャンセル）
   ├── assets/
-  │   └── map_template.html # Leaflet.js を使ったマップHTMLテンプレート
+  │   ├── map_template.html # Leaflet.js を使ったマップHTMLテンプレート
+  │   └── icons/
+  │       └── check.svg     # チェックボックスのチェックマーク（白、17章）
   └── requirements.txt
 
 
@@ -125,9 +127,27 @@
 4-1. MainWindow (app/main_window.py)
   - QMainWindow を継承
   - 左右のペインを QSplitter で分割
-  - 左: MapWidget + OffsetWidget
-  - 右: VideoWidget
+  - 左: ヘッダー行（タイトル「マップ」＋open_gpx_button）+
+    map_matching_status_label + MapWidget + OffsetWidget
+  - 右: ヘッダー行（タイトル「動画」＋open_video_button）+ VideoWidget
   - 下部: 再生ボタン群 + 出力ボタン
+  - open_gpx_button / open_video_button（17章）: 各カードヘッダーに
+    配置するボタン。クリックでopen_gpx_dialog() / open_video_dialog()
+    （メニューアクションと同じメソッド）を呼ぶ。open_video_buttonは
+    23章（読み込み順序ルール撤廃）により常にenabled
+    （2026-07-15変更。以前はGPX読み込み前はdisabledだった）
+  - _update_open_button_emphasis()（17章・23章）: 未読み込み状態の
+    ボタンをobjectName="primaryButton"にして強調表示する
+    （_set_button_emphasis()ヘルパー経由。objectName変更後は
+    style().unpolish()/polish()でQSSを再適用する必要があることを
+    実機検証済み）:
+      open_gpx_button: state.gpx_data is None の間 強調
+      open_video_button: state.video_path is None の間 強調
+        （2026-07-15変更。以前はstate.gpx_data is not None
+        との連動条件だったが、23章で読み込み順序ルールを撤廃した
+        ため、互いの読み込み状況に依存しない独立判定にした）
+    __init__()の初期化時、load_gpx()末尾（_apply_gps_source()経由）、
+    load_video()末尾で呼ぶ
   - アプリケーション状態を一元管理するステート:
       AppState（app/state.py で定義するデータクラス）として保持する
       video_path: str | None
@@ -140,18 +160,25 @@
       video_duration_ms: int
       video_time_scale: float  # 再生1msあたりの実世界ms数。通常動画は1.0
                                 # （タイムラプス動画対応。15章）
-  - GPX未読み込み（gpx_data is None）の間は、動画読み込み関連UI
-    （メニュー項目・ドラッグ&ドロップ受付）を無効化する
-      set_video_loading_enabled(bool) のような形でUI状態を制御する
-  - メニューに「ツール」→「検証モードを開く...」を追加する。
-    選択すると VerificationWindow（4-10節）を新規インスタンスとして
-    生成しshow()する。MainWindowのステートには一切影響しない
+  - GPX・動画の読み込みに順序制約は無い（23章、2026-07-15撤廃。
+    以前はGPX未読み込みの間、動画読み込み関連UIを無効化していた）
+  - dragEnterEvent/dropEvent（23章）: URLを持つドラッグは常に受け付け
+    （acceptProposedAction()）、ドロップ時は拡張子が".gpx"ならload_gpx()、
+    それ以外は常にload_video()を呼ぶ（動画かどうかの判定・エラー
+    メッセージ表示はload_video()内のFFmpegError処理に委ねる。
+    以前あった「GPX未読み込み時は動画ドロップを拒否」という
+    分岐は撤廃した）
+  - 「ツール」メニュー（旧VerificationWindow起動用。4-10節参照）は
+    23章の対応で削除した
   - on_force_sync_clicked()（OffsetWidgetの強制同期ボタンから配線）:
       動画の作成日時とGPXの記録開始時刻が大きくずれているケース
       （±ボタンでの手動調整では実質補正不可能な、日付をまたぐ
       レベルのずれ）に対する安全策。
       gpx_handler または video_creation_time が無い場合は
-      「先に動画を読み込んでください」の警告を表示して終了する。
+      「先にGPXファイルと動画の両方を読み込んでください」の警告を
+      表示して終了する（2026-07-15、23章の読み込み順序ルール撤廃に
+      伴い文言変更。以前は「先に動画を読み込んでください」固定
+      だったが、GPX側が無い可能性もあるため文言を汎用化した）。
       それ以外の場合:
         gpx_start_time = gpx_handler.get_all_points()[0].time
         video_start_true_time = video_creation_time
@@ -168,7 +195,7 @@
       （タイムラプス設定有効時）の場合は、再生位置msを実世界経過
       時間msに変換してから加算する。
   - load_gpx(path)（マップマッチング統合後のフロー。13章・4-6節・
-    4-11節・4-12節）:
+    4-11節・4-12節・23章）:
       1. GPXHandler.load(path) でパース、既存のトラックポイント
          有無チェック（従来通り）
       2. MapMatchingWorker（4-12節）に handler.get_all_points() を渡し
@@ -176,14 +203,31 @@
       3. ワーカー完了後、結果の points（時刻・標高は元のまま、
          座標のみスナップ済み）で
          gpx_handler.replace_points(points)（4-6節）を呼び出す
-      4. 以降は従来通り: state.gpx_path/gpx_data を設定、
-         map_widget.load_gpx_route()、動画読み込みUIの有効化、
-         出力ボタン状態更新
+      4. _apply_gps_source(handler, gpx_path=path)（下記、23章）を
+         呼び、GPXデータを内部状態に反映する
       ワーカーがキャンセル・エラーになった場合も replace_points()
       自体は必ず呼ぶ（元座標、または部分的にスナップ済みの座標で
       継続する。5-9節）
+      5. _update_map_matching_status(result, total_points=len(points))
+         （17章）を呼び、結果をmap_matching_status_labelに反映する
+  - _apply_gps_source(handler: GPXHandler, gpx_path: str)（23章、
+    2026-07-15追加）: GPXデータを内部状態に反映する共通処理。
+    load_gpx()（外部GPXファイル読み込み）と_try_load_embedded_gps()
+    （動画のCAMM埋め込み抽出、下記）の両方から呼ばれる:
+      self.gpx_handler = handler
+      self.state.gpx_path = gpx_path
+      self.state.gpx_data = handler.gpx
+      map_widget.load_gpx_route([(p.latitude, p.longitude)
+                                  for p in handler.get_all_points()])
+      _update_export_button_state()
+      _update_open_button_emphasis()
+      _update_route_range_highlight()
+    注: マップマッチング結果の反映（_update_map_matching_status()）
+    と動画埋め込みGPS採用の反映（_update_gps_source_status_for_camm()）
+    はこのメソッドの外（呼び出し元）で行う。ステータス表示の文言が
+    データの出所によって異なるため（5-9節・5-12節）。
   - load_video(path)（タイムラプス対応統合後のフロー。15章・4-15節・
-    4-16節）:
+    4-16節・23章）:
       1. get_creation_time() / get_duration_ms() 取得、
          state.video_path/video_creation_time/video_duration_ms/
          video_start_ms/video_end_ms を設定（従来通り）
@@ -206,8 +250,45 @@
          同じ値を反映する（このsetChecked/setValueが発火する
          timelapse_changedシグナル経由でstate.video_time_scale・
          再生レートも整合する）
-      7. video_widget.load(path) → _apply_playback_rate()（下記）
+      7. _try_load_embedded_gps(path)（下記、23章、2026-07-15追加）
+         を呼び、動画にCAMM埋め込みGPSがあればGPXデータとして採用する
+      8. video_widget.load(path) → _apply_playback_rate()（下記）
          → _update_export_button_state()
+  - _try_load_embedded_gps(path: str)（23章、2026-07-15追加。
+    同日中にstate.video_creation_time上書き処理を追加）:
+      try:
+          camm_points = extract_gps_track(path)  # 4-8節
+      except (CammTrackNotFoundError, CammEncodeError):
+          return  # 埋め込みが無い動画は何もしない（既存GPSデータを維持）
+      if not camm_points:
+          return
+      # MP4Boxの制約3（4-8節）によりcreation_timeがMP4Box実行時刻に
+      # 化けている場合があるため、CAMM先頭サンプルのepoch_timeで
+      # state.video_creation_timeを上書きする（実機で発生した不具合の
+      # 修正。23章末尾の追記参照）
+      first_point = min(camm_points, key=lambda p: p[0])
+      state.video_creation_time = datetime.fromtimestamp(
+          first_point[4], tz=timezone.utc)
+      handler = GPXHandler.from_camm_points(camm_points)  # 4-6節
+      _apply_gps_source(handler, gpx_path=path)
+      _update_gps_source_status_for_camm(len(camm_points))
+    「最後に読み込んだGPS付きファイルが常に優先される」ルール（23章）
+    は、_apply_gps_source()が呼ばれるたびに無条件でgpx_handler/
+    state.gpx_path/state.gpx_dataを上書きすることで実現している。
+    CAMM埋め込みが無い動画の場合はこの関数自体が早期returnするため、
+    既存のGPXデータ（外部GPXファイル由来・別動画のCAMM由来いずれも）
+    は変更されない。
+  - _update_gps_source_status_for_camm(point_count: int)（23章、
+    2026-07-15追加）: 動画のCAMM埋め込みをGPXデータとして採用した
+    際のステータス表示。マップマッチングは適用していないため、
+    _update_map_matching_status()とは別の文言
+    「✓ 動画に埋め込まれたGPSデータを使用（◯点）」を表示する
+    （_set_map_matching_status_label()共通ヘルパー経由。5-12節）
+  - _prompt_creation_time()（2026-07-15変更）: gpx_handlerが
+    未読み込み（None）の場合はデフォルト値の算出をスキップし、
+    現在時刻をデフォルトにする（23章。以前はgpx_handlerが必ず
+    存在する前提のassertがあったが、動画がGPXより先に読み込まれる
+    ケースがあるため撤廃した）
   - _prompt_timelapse_settings(has_audio: bool) -> tuple[bool, float]
     （15章。動画読み込み時に毎回表示するタイムラプス設定確認
     ダイアログ。UI上の常設タイムラプス設定コントロール（4-16節）が
@@ -238,10 +319,15 @@
       それ以外: state.video_time_scale = 1.0
       続けて _apply_playback_rate()、
       on_position_changed(video_widget.timeline.position_ms())
-      （プレビュー即時反映）、_update_export_button_state() を呼ぶ
+      （プレビュー即時反映）、_update_export_button_state()、
+      _update_video_info_label(interval_sec)（18章）を呼ぶ
+  - _current_playback_rate() -> float（19章。2026-07-15追加）:
+      state.video_time_scale == 1.0 の場合 1.0、それ以外は
+      1.0 / state.video_time_scale を返す。_apply_playback_rate()と
+      _on_reverse_tick()（19章）の速度計算ロジックを共通化したもの
   - _apply_playback_rate()（15章）:
       state.video_time_scale != 1.0 の場合:
-        video_widget.player.setPlaybackRate(1.0 / state.video_time_scale)
+        video_widget.player.setPlaybackRate(_current_playback_rate())
         video_widget.audio_output.setMuted(True)
       それ以外:
         video_widget.player.setPlaybackRate(1.0)
@@ -253,17 +339,28 @@
       時間にほぼ比例して進行することを確認済み。
   - 出力ボタンのラベルは「📤 Export & Test」とする（5-6節・8章の
     レイアウト詳細も参照）
-  - on_pause_clicked()（旧on_stop_clicked。5-5節。2026-07-13変更）:
-      video_widget.pause() のみ呼ぶ。Startマーカー位置へのシークは
-      行わない（旧仕様では停止＝一時停止＋Startへのシークだったが、
+  - on_play_clicked() / on_pause_clicked()（旧on_stop_clicked。5-5節・
+    19章。2026-07-13/2026-07-15変更）:
+      いずれも冒頭で_stop_reverse_timer()（19章）を呼んでから、
+      video_widget.play() / video_widget.pause() を呼ぶ。
+      on_pause_clicked()はStartマーカー位置へのシークを行わない
+      （旧仕様では停止＝一時停止＋Startへのシークだったが、
       「シークバーがドラッグできないため、途中で止めても先頭に
       戻ってしまうのは致命的」というフィードバックを受け、
       一時停止に徹する仕様に変更した。先頭に戻りたい場合は
       4-4節のシークバードラッグで代替する）
   - on_export_clicked()（5-10節・14章。出力後ローカル検証の統合）:
-      1. 出力先ディレクトリ選択ダイアログ（従来通り）
-      2. exporter.export(state, output_dir) を呼び出し、動画・GPX
-         パスを得る（従来通り。4-9節）
+      0. _confirm_and_apply_gps_coverage_crop()（21章、2026-07-15追加）
+         がFalseを返した場合は、その時点で処理全体を中断する
+         （保存ダイアログも開かない）
+      1. QFileDialog.getSaveFileName()で動画の保存先パス・ファイル名を
+         取得する（22章、2026-07-15変更。以前はgetExistingDirectory()
+         でフォルダのみ選択していた）。初期表示名は
+         exporter.default_video_filename(state)、フィルタは
+         "MP4 Files (*.mp4)"。キャンセル時（空文字列）は処理を中断する
+      2. exporter.export(state, video_output_path) を呼び出し、動画・
+         GPXパスを得る（4-9節。第2引数がoutput_dirから
+         video_output_pathに変更されたことに伴い呼び出し側も変更）
       3. build_mapillary_tools_command() でコマンド文字列を組み立てる
          （従来通り）
       4. mapillary_validator.is_mapillary_tools_available() が
@@ -283,7 +380,13 @@
   - QWebEngineView を継承
   - メソッド:
       load_gpx_route(points: list[tuple[float,float]])
-        → Leaflet polyline を JS で描画
+        → Leaflet polyline を JS で描画（loadRoute()。全区間を
+           一旦「範囲内」扱いで描画する。9章参照）
+      update_route_ranges(in_range: list[bool])
+        → runJavaScript で updateRouteRanges() を呼び、load_gpx_route()
+           で描画済みのルートをin_range（各点が動画のStart/End出力
+           範囲内かどうか）に応じて2色に塗り分け直す（20章）。
+           座標は再送しない（JS側がloadRoute()時点で保持している）
       update_marker(lat: float, lon: float)
         → runJavaScript で marker.setLatLng() + panTo()
       hide_marker()
@@ -315,6 +418,21 @@
       self.player.setSource(QUrl.fromLocalFile(path))
       self.player.positionChanged.connect(self.on_position_changed)
 
+  - load(path)（2026-07-15変更、先頭フレームの即時表示）:
+      setSource()の直後に以下を追加した:
+        self.player.play()
+        self.player.pause()
+        self.player.setPosition(0)
+      背景: 動画読み込み直後は何もデコードされておらず、再生ボタンを
+      押すまでQVideoWidgetが真っ暗のままだった。play()→pause()で
+      デコードパイプラインを一度動かし先頭フレームをレンダリングさせた
+      上で、setPosition(0)で位置を0msに戻す。実機検証
+      （Qt6.11、offscreenプラットフォーム）で、durationChangedを
+      待たずにsetSource()の直後にこの3行を呼んでも（Qt内部で
+      キューされ）正しく機能し、最終的にPausedState・position=0・
+      有効な映像フレーム（QVideoWidget.grab()が非nullな320x240画像を
+      返す）になることを確認済み。
+
   注（テスト時に判明した既知の問題）: QMediaPlayerにソースを
   setSource()した状態のままウィジェットを破棄すると、
   AVFoundationバックエンド（macOS）の後片付けがQtイベントループ外で
@@ -330,23 +448,55 @@
   - QWidget を継承し、paintEvent で自前描画
   - 要素:
       - 全体バー（動画全長）
-      - Start/End マーカー（ドラッグ可能な三角形ハンドル）
-      - 現在位置インジケーター（赤い縦線）
+      - Start/End マーカー（ドラッグ可能な三角形ハンドル。バー上端から
+        上向きに描画）
+      - 現在位置インジケーター（青い縦線。POSITION_LINE_COLOR =
+        QColor(37, 99, 235)。バー下端の下側に、Start/Endハンドルと
+        同形・同サイズの三角形を上下反転させて追加している
+        （2026-07-15追加。_draw_handle()に flip: bool = False
+        パラメータを設け、flip=Trueの場合は頂点をバー下端の位置y、
+        底辺をy+size側に描画することで上部ハンドルの鏡像にしている）。
+        色はEND_HANDLE_COLOR（赤系）と紛らわしかったため、青系に
+        変更した（2026-07-15）
       - 時刻ラベル（現在時刻、Start時刻、End時刻）
   - ドラッグ検出: mousePressEvent / mouseMoveEvent / mouseReleaseEvent
     - self._dragging は "start" / "end" / "position" / None の
       いずれか
-    - Start/Endハンドルのヒット判定（HANDLE_HIT_RADIUS_PX以内）に
-      該当しない場所を押した場合は "position" として扱い、
-      押した瞬間に一度 seek_requested を発火した上で、そのまま
+    - Start/Endハンドルは、Y座標がバー上端（rect.top()）以下
+      （＝上部三角マークの領域）の場合のみヒット判定を行う
+      （2026-07-15修正。現在地の下向き三角マーク追加後、Y座標を
+      見ずにX座標のみでStart/End判定していたため、バー下部や現在地
+      マーカー付近をクリックしてもX座標がStart/Endに近ければ誤って
+      Start/Endが動いてしまう不具合があった。Y座標の上限チェックを
+      追加することで、上部三角マークの領域のみがStart/Endの
+      ヒット領域になるようにした）
+    - 上記のStart/Endヒット領域に該当しない場所（バー本体、および
+      下部の現在地三角マークの領域）を押した場合は "position" として
+      扱い、押した瞬間に一度 seek_requested を発火した上で、そのまま
       ドラッグを継続すると mouseMoveEvent のたびに連続して
       seek_requested を発火する（スクラブ操作。2026-07-13追加。
       以前は押した瞬間の1回しかシークされず、ドラッグに追従
       しなかった。ユーザーから「シークバーがドラッグできないのは
       致命的」というフィードバックを受けて対応した）
   - Start/End の制約:
-      Start < End
+      Start < End（MIN_GAP_MS=100ms以上の間隔を維持。_clamp_start()/
+      _clamp_end()。set_start()/set_end()経由のプログラム的な設定
+      （リセット処理・テスト用セットアップ含む）に適用される）
       現在位置 < End に達したら停止 or Start に戻る
+      ドラッグ操作限定の追加制約（2026-07-15追加、
+      _clamp_start_for_drag()/_clamp_end_for_drag()。
+      mouseMoveEvent内でのみ使用）:
+        Startは現在地(position_ms)より後ろにはドラッグできない
+        Endは現在地(position_ms)より前にはドラッグできない
+      この制約をset_start()/set_end()自体（_clamp_start()/
+      _clamp_end()）には適用せず、ドラッグ専用メソッドとして分離した
+      理由: 動画読み込み直後などposition_msがまだ実際の再生位置と
+      同期していないタイミングでset_start()/set_end()が呼ばれる
+      ケース（テストでのセットアップ含む）があり、そこに位置制約を
+      適用すると意図しない値にクランプされてしまうことが実装時の
+      テスト回帰で判明したため。ユーザーが実際にハンドルをドラッグする
+      操作（＝mouseMoveEvent経由）にのみ適用することで、要望通り
+      「Start/Endを動かす時」の制約として機能させている。
 
 4-5. OffsetWidget (app/offset_widget.py)
   - QWidget を継承
@@ -368,6 +518,17 @@
 
 4-6. GPXHandler (app/gpx_handler.py)
   - load(path: str) -> gpxpy.GPX
+  - from_camm_points(camm_points: list[tuple[int, float, float, float,
+    float]]) -> GPXHandler（23章、2026-07-15追加。classmethod）
+      camm_encoder.extract_gps_track()の戻り値（(relative_ms,
+      latitude, longitude, elevation, epoch_time)のリスト）から、
+      実時刻付きのGPXHandlerを構築する。epoch_time
+      （datetime.fromtimestamp(epoch_time, tz=UTC)）のみを使い、
+      relative_ms（動画自身のタイムライン上の位置）は無視する。
+      構築したGPXHandlerは、以降get_all_points()等の既存メソッド
+      経由でしか参照されないため、load()で読み込んだ通常のGPXHandler
+      と完全に等価に扱える（interpolate_position/has_overlap/
+      classify_points_in_range/export_trimmed等すべてがそのまま使える）。
   - get_all_points() -> list[GPXTrackPoint]
       GPX内の全トラック・全セグメントのポイントを時刻順にソートし、
       1本の連続した点列として返す（複数トラック/セグメントも結合する）
@@ -458,6 +619,29 @@
     has_overlap/export_trimmed/get_points_for_camm）はget_all_points()
     経由でしか点列を参照しないため、置き換え後も既存ロジックへの影響は
     ない。MainWindow.load_gpx()（4-1節）からのみ呼ばれる想定。
+
+  - classify_points_in_range(video_start_ms, video_end_ms, offset_sec,
+                              video_creation_time, video_time_scale=1.0
+                             ) -> list[bool]（20章、2026-07-15追加）
+    get_all_points()と同じ順序・点数で、各点が_raw_time_range()の
+    範囲内（＝動画のStart/End出力に含まれる範囲）かどうかを返す。
+    has_overlap()と同じ_raw_time_range()を再利用しているため、
+    video_time_scale・offset_secの扱いも他メソッドと一貫している。
+    マップ上のルート線の色分け表示（MapWidget.update_route_ranges()）
+    に使う。
+
+  - clip_to_gps_coverage(video_start_ms, video_end_ms, offset_sec,
+                          video_creation_time, video_time_scale=1.0
+                         ) -> tuple[int, int]（21章、2026-07-15追加）
+    _raw_time_range()で得たraw_start/raw_endが、GPXの実記録範囲
+    （points[0].time 〜 points[-1].time）をはみ出している場合、その
+    はみ出た分だけStart/Endを記録範囲側に切り詰めた(video_start_ms,
+    video_end_ms)を返す。完全にカバーされている場合や記録点が無い
+    場合は入力をそのまま返す（＝クロップ不要の判定にも使える）。
+  - _raw_time_to_video_ms(raw_time, offset_sec, video_creation_time,
+                          video_time_scale) -> int
+    _raw_time_range()の逆変換。GPXの生の記録時刻から対応する動画
+    再生位置(ms)を求める内部ヘルパー（clip_to_gps_coverage()専用）。
 
 4-7. VideoHandler (app/video_handler.py)
   - get_metadata(path: str) -> dict
@@ -679,16 +863,18 @@
            ])
       4. 一時ファイル（.raw, .nhml）を削除
 
-  - extract_gps_track(video_path: str) -> list[tuple[int, float, float, float]]
-    embed_gps_track() の逆操作。検証モード（4-10節 VerificationWindow）で
-    使用する。VerificationWindowはプレビュー用の位置表示にしか使わない
-    （time_gps_epoch等の付加情報は不要）ため、戻り値は
-    embed_gps_track()以前と同じ(relative_ms, latitude, longitude,
-    elevation)の4要素タプルのリストとし、Type 6の追加フィールド
-    （time_gps_epoch・gps_fix_type・各種accuracy・velocity）は
-    読み捨てる。
-    実機検証で embed → extract の往復が(relative_ms, lat, lon,
-    elevation)の4フィールドについて完全に一致することを確認済み。
+  - extract_gps_track(video_path: str)
+      -> list[tuple[int, float, float, float, float]]
+    embed_gps_track() の逆操作。戻り値はembed_gps_track()の入力と
+    対称な(relative_ms, latitude, longitude, elevation, epoch_time)
+    の5要素タプルのリスト（2026-07-15変更。以前は検証モード
+    VerificationWindow専用でtime_gps_epoch等を読み捨てた4要素
+    タプルだったが、23章でCAMM埋め込みGPSをGPXHandler相当のデータ
+    として取り込む（GPXHandler.from_camm_points()、4-6節）ために
+    epoch_timeが必要になったため、読み捨てるのをやめた）。
+    実機検証で embed → extract の往復が5フィールドすべてについて
+    完全に一致することを確認済み（tests/test_camm_encoder.py
+    test_embed_then_extract_round_trip）。
     ロジック:
       1. subprocess.run(["MP4Box", "-info", video_path]) の出力を
          パースし、"Media Type: meta:camm" を含むトラックのIDを特定
@@ -700,37 +886,48 @@
          dataLength・累積バイトオフセットを取得
       4. .media ファイルから該当バイト列を読み、
          CAMM_GPS_TYPE6_STRUCT.unpack(chunk) でデコードして
-         (relative_ms, latitude, longitude, elevation) を得る
-         （time_gps_epoch等の残りのフィールドは破棄）
+         (relative_ms, latitude, longitude, elevation, time_gps_epoch)
+         を得る（gps_fix_type・各種accuracy・velocityは引き続き破棄）
       5. 一時ファイル（.nhml, .media）を削除
 
-  - interpolate_camm_points(points: list[tuple[int, float, float, float]],
-                            video_time_ms: int
-                           ) -> tuple[float, float] | None
-    検証モード用の補間関数。GPXHandler._interpolate_at() と同様の
-    二分探索＋線形補間ロジックだが、絶対時刻ではなく
-    relative_ms（動画内の相対ミリ秒）を直接キーにする点がシンプルな
-    差分（video_creation_timeやoffsetの計算が一切不要）。
-    points は relative_ms でソート済みの前提。範囲外は None を返す。
+  - interpolate_camm_points()は2026-07-15に削除した（23章）。
+    検証モード（VerificationWindow）専用のヘルパーだったが、
+    検証モード廃止に伴い呼び出し元が無くなったため。動画埋め込み
+    GPSをGPXデータとして扱う経路（GPXHandler.from_camm_points()）
+    では、通常のGPXHandler.interpolate_position()
+    （二分探索＋線形補間、絶対時刻ベース）がそのまま使われる。
 
 4-9. Exporter (app/exporter.py)
-  - export(state: AppState, output_dir: str)
+  - default_video_filename(state: AppState) -> str（22章、
+    2026-07-15追加）
+      保存ダイアログ（QFileDialog.getSaveFileName）に初期表示する
+      動画ファイル名を返す: f"{元動画ファイル名（拡張子除く）}_synced.mp4"
+      （連番は付与しない。保存ダイアログ自体がOS標準の上書き確認を
+      行うため）
+
+  - export(state: AppState, video_output_path: str)（22章、
+    2026-07-15変更: 第2引数が output_dir から video_output_path に
+    変更された）
     1. GPXとオフセット適用後の時刻範囲が動画Start〜Endと重複するか
        事前チェック（重複しない場合はこの関数を呼び出せない
        ＝出力ボタンが無効化されている想定）
-    2. 出力ファイル名を生成:
-         video_name = f"{元動画ファイル名（拡張子除く）}_synced.mp4"
-         gpx_name   = f"{元GPXファイル名（拡張子除く）}_synced.gpx"
-    3. 出力先に同名ファイルが存在する場合は連番を付与:
-         例: "ride01_synced.mp4" が存在すれば
-             "ride01_synced_2.mp4" のように連番を増やして
-             重複しなくなるまで繰り返す
+    2. video_output_path の親ディレクトリをGPX出力先とし、GPX出力
+       ファイル名を生成:
+         gpx_name = f"{元GPXファイル名（拡張子除く）}_synced.gpx"
+       動画側は video_output_path をそのまま使う（保存ダイアログで
+       ユーザーが明示的に指定した値であり、連番付与は行わない）
+    3. GPX出力先に同名ファイルが存在する場合は連番を付与:
+         例: "ride01_synced.gpx" が存在すれば
+             "ride01_synced_2.gpx" のように連番を増やして
+             重複しなくなるまで繰り返す（generate_output_path()。
+             動画側は保存ダイアログの時点でOS標準の上書き確認が
+             既に行われているため、この連番ロジックは対象外）
     4. VideoHandler.export_trimmed() を呼び出し、一時パスに
        Smart Cut済み動画（creation_time設定込み）を書き出す
     5. GPXHandler.get_points_for_camm() でCAMM用の点列を取得し、
        CammEncoder.embed_gps_track() を呼び出して、4.の一時動画に
-       CAMMトラックを追加した最終版を video_name の場所に書き出す
-       （4.の一時ファイルは削除する）
+       CAMMトラックを追加した最終版を video_output_path の場所に
+       書き出す（4.の一時ファイルは削除する）
     6. GPXHandler.export_trimmed() を呼び出し、バックアップ用の
        GPXファイルを書き出す
     ※ 完了ダイアログの表示・mapillary_toolsコマンド例の生成・14章の
@@ -756,42 +953,13 @@
                                      state.video_start_ms, state.video_time_scale))
       video_time_scale=1.0（通常動画）では従来と同じ計算になる。
 
-4-10. VerificationWindow (app/verification_window.py)
-  Mapillaryへのアップロード前に、出力済みMP4のGPS埋め込みが
-  正しいかを目視確認するための独立ウィンドウ。MainWindowの
-  ステート（GPX読み込み状況、Start/End、オフセット等）には
-  一切依存しない。
-
-  - QMainWindow を継承（MainWindowとは別インスタンス）
-  - MainWindowのメニュー（「ツール」→「検証モードを開く...」）から
-    起動する
-  - 構成: MapWidget（左） + VideoWidget（右）+ 再生/停止ボタン
-    （MainWindowのレイアウトを簡略化したもの。OffsetWidgetや
-    出力ボタンは無い）
-  - camm_points: list[tuple[int, float, float, float]] を保持する
-    インスタンス変数
-
-  - open_video(path: str):
-      1. CammEncoder.extract_gps_track(path) を呼び出す
-      2. CammTrackNotFoundError の場合は「この動画にはGPSトラックが
-         埋め込まれていません」とエラーダイアログを表示して中断
-      3. self.camm_points に結果を保存
-      4. map_widget.load_gpx_route(
-           [(lat, lon) for _, lat, lon, _ in self.camm_points]
-         ) でルートを描画
-      5. video_widget.load(path) で動画を読み込む
-
-  - video_widget.position_changed シグナルに接続:
-      def on_position_changed(self, ms: int):
-          pos = interpolate_camm_points(self.camm_points, ms)
-          if pos is not None:
-              self.map_widget.update_marker(*pos)
-          else:
-              self.map_widget.hide_marker()
-
-  - closeEvent: MainWindowの4-3節と同様、
-    video_widget.player.stop() → setSource(QUrl()) の順で
-    後片付けしてから閉じる
+4-10. （廃止: 旧VerificationWindow。23章参照）
+  app/verification_window.py・tests/test_verification_window.pyは
+  2026-07-15に削除した。動画に埋め込まれたCAMM GPSトラックを
+  目視確認する機能は、通常モード（MainWindow）に統合されたため、
+  独立ウィンドウとしては不要になった（23章の背景・設計を参照）。
+  以降の4-11節以降の番号は振り直していない（本ドキュメントの既存の
+  節番号への参照を維持するため）。
 
 4-11. MapMatcher (app/map_matcher.py)
   GPX読み込み時（5-9節）に、記録軌跡を道路網へスナップする。
@@ -1055,6 +1223,33 @@
         実装とする。
 
 
+4-17. theme (app/theme.py) — 16章・17章・18章
+  - アプリ全体の配色・QSSを定義するモジュール（ウィジェットクラスではない）
+  - Palette（dataclass）: accent / accent_hover / accent_bg / accent_border /
+    bg / card_bg / border / text / text_subtle / warn / error の
+    11トークン（warn/errorは17章のマップマッチング結果表示で使用）
+  - LIGHT / DARK: それぞれのパレット定数（16章参照）
+  - CHECKMARK_ICON_PATH: assets/icons/check.svg（18章）への絶対パス
+    （__file__基準で解決）
+  - build_stylesheet(p: Palette) -> str
+      パレットからQSS文字列を組み立てる（QMainWindow/QWidget、
+      QFrame#card、QPushButton（通常/#primaryButton/:hover/:disabled）、
+      QLabel[subtle="true"]/[state="ok"|"warn"|"error"]、
+      QCheckBox::indicator:checked（CHECKMARK_ICON_PATHを
+      image: url()で指定。18章）、
+      QDoubleSpinBox/QDateTimeEdit/QLineEdit、
+      QSplitter::handle、QMenuBar/QMenu、QDialogButtonBoxが対象）
+  - resolve_palette(app: QApplication) -> Palette
+      QApplication.styleHints().colorScheme() でmacOSのシステム外観
+      （ライト/ダーク）を判定する。offscreenプラットフォーム
+      （テスト実行時）ではQt.ColorScheme.Unknownが返ることを実機
+      確認済みのため、Dark以外はすべてLightにフォールバックする
+  - apply_theme(app: QApplication) -> None
+      resolve_palette() + build_stylesheet() の結果を
+      app.setStyleSheet() で適用する。main.py からQApplication生成
+      直後に1回呼び出す
+
+
 5. 動画とマップの連携ロジック
 ----------------------------------------------------------------
 
@@ -1146,25 +1341,44 @@
 
   QMainWindow
   └── QWidget (central)
-      └── QVBoxLayout
+      └── QVBoxLayout（余白16px・間隔12px）
           ├── QSplitter (horizontal)
-          │   ├── QWidget (左ペイン)
-          │   │   └── QVBoxLayout
+          │   ├── QFrame (左ペイン、objectName="card")
+          │   │   └── QVBoxLayout（余白12px・間隔10px）
+          │   │       ├── QHBoxLayout (ヘッダー行)
+          │   │       │   ├── QLabel("マップ", subtle)
+          │   │       │   ├── QSpacerItem
+          │   │       │   └── QPushButton("GPXを開く", open_gpx_button)
+          │   │       ├── QLabel (map_matching_status_label、既定非表示)
           │   │       ├── MapWidget          ← stretch: 1
           │   │       └── OffsetWidget       ← fixed height
-          │   └── QWidget (右ペイン)
-          │       └── QVBoxLayout
+          │   └── QFrame (右ペイン、objectName="card")
+          │       └── QVBoxLayout（余白12px・間隔10px）
+          │           ├── QHBoxLayout (ヘッダー行)
+          │           │   ├── QLabel("動画", subtle)
+          │           │   ├── QSpacerItem
+          │           │   └── QPushButton("動画を開く", open_video_button)
+          │           ├── QLabel (video_info_label、既定非表示)
           │           ├── QVideoWidget       ← stretch: 1
-          │           └── CustomTimeline     ← fixed height ~80px
-          └── QHBoxLayout (ボタン行)
-              ├── QPushButton("▶ 再生")
-              ├── QPushButton("⏸ 一時停止")
-              ├── QLabel (現在時刻表示)
+          │           ├── CustomTimeline     ← fixed height ~80px
+          │           └── QHBoxLayout (transport_layout、間隔8px。19章)
+          │               ├── QPushButton("⏪ 逆再生", reverse_button)
+          │               ├── QPushButton("⏮ コマ戻り", step_back_button)
+          │               ├── QPushButton("⏸ 一時停止", pause_button)
+          │               ├── QPushButton("⏭ コマ送り", step_forward_button)
+          │               ├── QPushButton("▶ 再生", play_button)
+          │               ├── QSpacerItem
+          │               └── QLabel (現在時刻表示、current_time_label)
+          └── QHBoxLayout (ボタン行、間隔8px)
               ├── QSpacerItem
-              └── QPushButton("📤 Export & Test")
+              └── QPushButton("📤 Export && Test", objectName="primaryButton")
 
   初期ウィンドウサイズ: 1280 x 720
   左右ペインの初期比率: 1:1
+  配色・QSSの詳細は16章（UIテーマ）、open_gpx_button/open_video_buttonの
+  強調表示・map_matching_status_labelの詳細は17章、
+  video_info_label・チェックボックスのチェックマークの詳細は18章、
+  transport_layout（再生制御ボタン群）の詳細は19章を参照
 
 
 9. map_template.html の構成
@@ -1188,13 +1402,62 @@
           attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a> contributors'
       }).addTo(map);
 
-      var routeLine = null;
+      var currentLatLngs = [];  // loadRoute()で保持し、updateRouteRanges()で再利用する
+      var routeSegments = [];   // ルート線を構成するL.Polylineの配列（20章）
       var marker = null;
 
+      function clearRouteSegments() {
+          routeSegments.forEach(function(line) { map.removeLayer(line); });
+          routeSegments = [];
+      }
+
+      // inRangeFlagsの切り替わり目でセグメントに分割する。継ぎ目が
+      // 途切れないよう、直前の点も新セグメントの先頭に含める。
+      function splitIntoSegments(latlngs, inRangeFlags) {
+          var segments = [];
+          var current = null;
+          for (var i = 0; i < latlngs.length; i++) {
+              var flag = inRangeFlags[i];
+              if (!current || current.inRange !== flag) {
+                  if (current) segments.push(current);
+                  current = {inRange: flag, latlngs: []};
+                  if (i > 0) current.latlngs.push(latlngs[i - 1]);
+              }
+              current.latlngs.push(latlngs[i]);
+          }
+          if (current) segments.push(current);
+          return segments;
+      }
+
+      function renderRouteSegments(inRangeFlags) {
+          clearRouteSegments();
+          if (currentLatLngs.length === 0) return;
+          var segments = splitIntoSegments(currentLatLngs, inRangeFlags);
+          segments.forEach(function(seg) {
+              if (seg.inRange) {
+                  routeSegments.push(
+                      L.polyline(seg.latlngs, {color: '#16a34a', weight: 3}).addTo(map)
+                  );
+              } else {
+                  // クロップされる領域: 範囲内と同じ太さのグレー単色
+                  // （緑の縁取りなし。20章参照）
+                  routeSegments.push(
+                      L.polyline(seg.latlngs, {color: '#6b7280', weight: 3}).addTo(map)
+                  );
+              }
+          });
+      }
+
       function loadRoute(latlngs) {
-          if (routeLine) map.removeLayer(routeLine);
-          routeLine = L.polyline(latlngs, {color: 'blue', weight: 3}).addTo(map);
-          map.fitBounds(routeLine.getBounds());
+          currentLatLngs = latlngs;
+          renderRouteSegments(latlngs.map(function() { return true; }));
+          if (latlngs.length > 0) {
+              map.fitBounds(L.latLngBounds(latlngs));
+          }
+      }
+
+      function updateRouteRanges(inRangeFlags) {
+          renderRouteSegments(inRangeFlags);
       }
 
       function updateMarker(lat, lon) {
@@ -1217,7 +1480,8 @@
       }
 
       function clearMap() {
-          if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+          clearRouteSegments();
+          currentLatLngs = [];
           if (marker) { map.removeLayer(marker); marker = null; }
       }
     </script>
@@ -1226,6 +1490,7 @@
 
   Python側からの呼び出し例:
     page.runJavaScript(f"loadRoute({json.dumps(latlngs)});")
+    page.runJavaScript(f"updateRouteRanges({json.dumps(in_range)});")
     page.runJavaScript(f"updateMarker({lat}, {lon});")
     page.runJavaScript("hideMarker();")
     page.runJavaScript("clearMap();")
@@ -1616,6 +1881,502 @@
     確認ダイアログ（_prompt_timelapse_settings()、4-1節）を追加する
     方式を採用した。常設コントロール自体は、読み込み後に設定を
     変更したい場合のために引き続き残している。
+
+
+16. UIテーマ（外観の刷新）
+----------------------------------------------------------------
+
+  背景（spec.txt 4章「外観」節）:
+    2026-07-15、ユーザーより「PyQt6のデフォルトスタイルのままで
+    手作り感がチープ、他のgpxシリーズ（gpx-navi、gpx-editor、
+    gpx-vcycl）とのバランスを考えたデザインにしてほしい」との
+    要望を受けた。実装前に他シリーズの現物を調査した:
+      - gpx-editor（Webアプリ、Vite/React）: パープル基調
+        （--accent: #9333ea系）、system-uiフォント、角丸カードUI、
+        light/dark両対応のCSSカスタムプロパティ設計
+      - gpx-vcycl（Webアプリ）: サイクルコンピュータ風の常時ダーク
+        HUD、青/赤アクセント。design-preview.htmlは配色検討用の
+        未使用ファイルで実運用CSSではない
+      - gpx-navi: React Native製モバイルアプリで技術系統が異なる
+    gpx-vsyncは「撮影後にファイルを処理するツール」であり、常時HUD
+    表示のgpx-vcyclよりも同じくツール系のgpx-editorに近い立ち位置と
+    判断し、カードUI・角丸・ライト/ダーク対応という構造は
+    gpx-editorを踏襲しつつ、コンセプトカラーはユーザー指定により
+    グリーン系（他シリーズのパープル・青赤とは別の、本ツール固有の
+    アクセントカラー）とした。
+
+  配色パレット（app/theme.py Palette。4-17節）:
+                    Light                 Dark
+      accent        #16a34a               #4ade80
+      accent hover  #15803d               #22c55e
+      accent bg     rgba(22,163,74,.10)   rgba(74,222,128,.15)
+      accent border rgba(22,163,74,.5)    rgba(74,222,128,.5)
+      bg            #ffffff               #16171d
+      card bg       #f7faf8               #1c211d
+      border        #e5e4e7               #2e303a
+      text          #08060d               #f3f4f6
+      text subtle   #6b6375               #9ca3af
+
+  ライト/ダーク自動切替（実機検証済み、2026-07-15）:
+    Qt6.11のQApplication.styleHints().colorScheme()でmacOSの
+    システム外観を検出できることをoffscreen環境で確認した
+    （Qt.ColorScheme.Light/Dark/Unknown列挙体が存在することを確認。
+    offscreenプラットフォーム自体はUnknownを返すため、テスト実行時は
+    Lightにフォールバックする実装とした。実機のcocoaプラットフォーム
+    では実際のシステム設定に応じてLight/Darkが返る）。
+
+  適用方法:
+    main.py で QApplication 生成直後に apply_theme(app) を1回呼び、
+    app.setStyleSheet() でアプリ全体にQSSを適用する（個々の
+    ウィジェットへの個別setStyleSheet()は行わない）。
+
+  MainWindowのレイアウト変更（4-1節・8章）:
+    - 左右ペインをQWidgetからQFrame（objectName="card"）に変更し、
+      QSSでカード状（角丸8px・薄ボーダー・背景差）に描画されるように
+      した
+    - Exportボタンにのみ objectName="primaryButton" を付与し、
+      アクセントグリーンで塗りつぶした強調ボタンとして区別する
+      （Play/Pause等の副次的な操作はボーダーのみの控えめな見た目の
+      ままとする）
+    - 全体・各ペイン内・ボタン行の余白/間隔を調整（詰まりすぎていた
+      レイアウトに16px/12px/8px程度の余白を追加）
+
+  CustomTimeline（app/video_widget.py）・地図ルート線
+  （assets/map_template.html）の配色統一:
+    QSSの適用範囲外であるQPainterによる直接描画（タイムラインの
+    選択範囲ハイライト）と、Leaflet.jsのポリライン（GPXルート線）に
+    ついても、既存の任意色（青系）からアクセントグリーン
+    （#16a34a、ハイライトは半透明の rgba(22,163,74,150)）に変更し、
+    視覚的な一貫性を持たせた。現在位置を示す赤い縦線、Start/End
+    ハンドルの色分け（開始=緑・終了=赤）、現在地マーカー（赤）は
+    機能的な意味を持つ配色のため維持している。
+
+  副次的に発見した既存の不具合（本改修中に修正）:
+    Exportボタンのラベル文字列 "\U0001f4e4 Export & Test" 内の
+    単体の "&" が、QPushButtonにおいてQtのニーモニック（アクセラ
+    レータキー）記号として解釈され、表示が崩れる（"& T"が消えて
+    次の文字に下線が付く）不具合をheadlessスクリーンショットで
+    発見した。テーマ変更とは無関係の既存不具合だが、見た目の
+    改善作業の一環として "&&"（リテラルな"&"1文字として表示される
+    Qtのエスケープ表記）に修正した。QPushButton.text()は
+    エスケープ前の生文字列（"&&"含む）を返す仕様のため、対応する
+    テスト（test_export_button_label_is_export_and_test）の
+    アサーションもあわせて更新した。
+
+
+17. カードヘッダーの開くボタン・マップマッチング結果表示
+----------------------------------------------------------------
+
+  背景（spec.txt 4章「外観」節、5-9節末尾）:
+    2026-07-15、ユーザーより以下2点の要望を受けた:
+      a) 「GPXを開く」「動画を開く」が現状メニューバーにしか無く、
+         ウィンドウ内にボタンを置きたい
+      b) マップマッチングはタイムアウトすることもあるため、
+         全点取得完了しているかどうかを編集画面のどこかに表示したい
+    a)については、独立した上部ツールバー案と、左右カードのヘッダーに
+    それぞれ配置する案を提示し、後者（カードヘッダー案）が選ばれた。
+    未読み込み状態を目立たせる方法として、既存のprimaryButton
+    （16章）のQSSをそのまま流用し、objectName切り替え＋
+    style().unpolish()/polish()で動的に強調のON/OFFを切り替える
+    方式を採用した（headlessスクリーンショットで塗り色が実際に
+    切り替わることを実機確認済み）。
+
+  b)の判定ロジックについて（app/main_window.py
+  _update_map_matching_status()）:
+    match_route()（4-11節）のstatusフィールドは "完了" | "エラー" |
+    "キャンセル" の3値だが、"エラー" は「チャンク処理自体は全て成功
+    したが、スナップ対象の点が1つも無かった（n_snapped == 0）」場合
+    にも返る（既存ロジック: final_status = "完了" if n_snapped > 0
+    else "エラー"）。そのため、成否の判定はstatus文字列ではなく
+    result.error（Noneかどうか）を優先させた:
+      - error is None: 全チャンク成功（state="ok"、緑）。
+        n_snappedが0でも「元々スナップ不要だった」だけであり失敗
+        ではないため、成功表示とする
+      - error is not None かつ status=="キャンセル": 1チャンク目の
+        失敗により自動キャンセルされたケース（state="error"、赤）
+      - error is not None かつ status!="キャンセル": 2チャンク目以降
+        の一部が失敗したが処理は継続したケース（state="warn"、
+        オレンジ）。エラー詳細はQLabel.setToolTip()でホバー時にのみ
+        表示し、文言のパース（"chunk N: ..."形式）には依存しない
+
+  表示先: 左カード（マップ）のヘッダー行の直下に
+  map_matching_status_label（QLabel）を配置。GPX未読み込み時は
+  非表示（setVisible(False)）、マップマッチング完了後に表示する。
+
+  補足（2026-07-15追加、同要望のフォローアップ）:
+    map_matching_status_labelが緑色「✓ マップマッチング完了」で
+    表示されているにも関わらずn_snappedが点数より少ない
+    （例: 382点中370点）ケースについて、「最後のチャンクが集計
+    から漏れているのでは」との懸念を受けた。合成データ（382点、
+    最終チャンクを意図的に32点＝端数にした上で、そのうち12点を
+    "unmatched"として返すダミーAPI）で実機検証したところ、
+    match_route()のfor c in range(total_chunks)ループは最終
+    チャンク（端数）も含めて欠落なく処理され、n_snapped=370・
+    matched_points総数=382（欠落なし）となることを確認した
+    （tests/test_map_matcher.pyには回帰目的の専用テストは追加して
+    いない。都度の疑義に対する調査記録として本節に残す）。
+    すなわちerror is None（緑色表示）の場合の「点数 < 全体数」は
+    チャンク処理の失敗や欠落ではなく、Valhalla側が一部の点を
+    道路に自信を持ってスナップできなかった（type="unmatched"）
+    ことを意味し、元のGPS座標がそのまま採用される、正常な
+    フォールバック動作である。
+
+
+18. 動画情報表示・チェックボックスの見た目改善
+----------------------------------------------------------------
+
+  背景（spec.txt 4章「外観」節）:
+    2026-07-15、UIを実際に使ったユーザーから2点の要望を受けた:
+      a) タイムラプス設定チェックボックスのチェック時の見た目が
+         「ただの緑塗りつぶし」でチェックマークが無く、いまいち
+      b) 動画側にもfps・タイムラプス設定などの素性を示すテキストを
+         読み込み後に表示してほしい。表示位置は左（マップ側）の
+         行に上下位置を揃えてほしい
+
+  a) チェックボックスのチェックマーク（app/theme.py, assets/icons/check.svg）:
+    QSSのQCheckBox::indicator:checkedにimage: url(...)でSVG
+    アイコンを指定できるかを実装前にheadless環境で実機検証し
+    （白いチェックマークが緑地の上に正しく描画されることを
+    スクリーンショットで確認済み）、以下の方式を採用した:
+      - assets/icons/check.svg: 白いチェックマーク、透過背景
+        （viewBox 0 0 16 16、strokeベースのシンプルな意匠）
+      - theme.py: CHECKMARK_ICON_PATH（__file__基準の絶対パス）を
+        定義し、build_stylesheet()のQCheckBox::indicator:checked
+        ルールに image: url({CHECKMARK_ICON_PATH}); を追加
+    QSSのurl()は相対パスだと解決基準が不明瞭になりやすいため、
+    実行時に__file__から解決した絶対パスを埋め込む方式とした
+    （macOS単一プラットフォーム対応のため、パス区切り文字の
+    差異は考慮不要）。
+
+  b) 動画情報表示（app/main_window.py）:
+    - video_info_label（QLabel）を右カード（動画）のヘッダー行の
+      直下に配置。左カードのmap_matching_status_labelと同じ位置
+      （ヘッダー行の直後）に置くことで、ヘッダー行の高さが左右で
+      揃っている前提のもと、上下位置が自然に一致する
+    - _update_video_info_label(interval_sec: float):
+        state.video_path is None: 非表示
+        self._video_fps is None: "fps不明"
+        それ以外: f"{fps:.2f}fps"
+                  state.video_time_scale != 1.0 の場合は
+                  f"（{interval_sec:g}sタイムラプス）" を追記
+    - on_timelapse_changed()（15章）の末尾から呼ぶことで、
+      load_video()内のtimelapse_widget.reset()や
+      _prompt_timelapse_settings()由来のsetChecked/setValue、
+      および読み込み後の常設タイムラプス設定チェックボックスの
+      手動変更、いずれの経路でも自動的にラベルが更新される
+      （on_timelapse_changed自体は複数の経路から発火する既存の
+      シグナルハンドラであり、新たな呼び出し箇所を追加する必要が
+      なかった）
+
+
+19. 再生制御ボタン群の動画カード内移動・逆再生/コマ送り機能
+----------------------------------------------------------------
+
+  背景（spec.txt 5-5節）:
+    2026-07-15、ユーザーより「ウィンドウ左下の再生・一時停止ボタンを
+    動画枠内のシークバーの下に移動し、逆再生・コマ戻り・一時停止・
+    コマ送り・再生の5ボタンにしてほしい。コマ送り・コマ戻りは1フレーム
+    単位で」との要望を受けた。
+
+  逆再生の実現方式（実機検証済み、2026-07-15）:
+    QMediaPlayer.setPlaybackRate()に負値（例: -1.0）を設定しても
+    エラーにはならないが、実際にはplaybackRate()の値が黙って0.0に
+    丸められることをQt6.11のFFmpegベースマルチメディアバックエンド
+    （macOS、offscreen環境）で確認した。すなわちこのバックエンドは
+    ネイティブな逆再生に対応していない。
+    代替として、QTimer（REVERSE_TICK_MS=40ms間隔）でplayer.position()
+    を少しずつ減算していく疑似逆再生方式を採用した。同種の手法
+    （setPositionを短い間隔で30回連続呼び出し）を実機で検証し、
+    クラッシュせず位置が単調に減少することを確認済み。
+    - on_reverse_clicked(): video_widget.pause()の上で
+      self._reverse_timer.start()（interval=REVERSE_TICK_MS、
+      __init__でQTimer(self)として生成しtimeout→_on_reverse_tick()
+      に接続済み）
+    - _on_reverse_tick():
+        step_ms = round(REVERSE_TICK_MS * _current_playback_rate())
+        new_pos = player.position() - step_ms
+        new_pos <= timeline.start_ms() の場合:
+          player.setPosition(timeline.start_ms())
+          タイマー停止
+        それ以外: player.setPosition(new_pos)
+      _current_playback_rate()を使うことで、タイムラプス設定有効時の
+      順再生と同じ体感速度で巻き戻る（4-1節参照）
+    - _stop_reverse_timer(): self._reverse_timer.stop()。
+      on_play_clicked() / on_pause_clicked() / _step_frame() /
+      load_video() / closeEvent() の冒頭で呼び、逆再生と他の操作が
+      同時に走らないようにする
+
+  コマ送り・コマ戻り（app/main_window.py _step_frame(direction)）:
+    - 1フレーム分のミリ秒数は round(1000 / self._video_fps) で算出する
+    - video_time_scale（タイムラプス設定）の影響は受けない。
+      「1フレーム」は常に動画ファイル自身のネイティブなフレーム単位を
+      指すため（15章のタイムラプス時間変換とは無関係の概念）
+    - video_widget.seek()（既存、Start/Endで自動クランプ）を使って
+      移動するため、Start/Endの範囲外には出ない
+    - self._video_fps is None（fps取得失敗）の場合は _step_frame()は
+      何もしない。_update_frame_step_buttons_enabled()を
+      __init__時・load_video()でのfps取得直後に呼び、
+      step_back_button/step_forward_buttonの有効・無効を同期する
+
+  レイアウト変更（8章参照）:
+    play_button・pause_button・current_time_labelをウィンドウ下部の
+    ボタン行から、動画カード内・CustomTimelineの直下（新設の
+    transport_layout）へ移動した。ボタン順序は「⏪ 逆再生」「⏮ コマ戻り」
+    「⏸ 一時停止」「⏭ コマ送り」「▶ 再生」（ユーザー指定順）。
+    ウィンドウ下部のボタン行にはExportボタンのみ残る。
+
+
+20. マップ上でのクロップ領域の可視化
+----------------------------------------------------------------
+
+  背景（spec.txt 5-2節）:
+    2026-07-15、ユーザーより「シークバー上のStart/Endで定義される
+    出力領域と、クロップされる領域の区別を左の地図上でもつけたい。
+    クロップ領域（＆動画のタイムスタンプから外れている領域）は、
+    枠線緑のグレーの太線にしたい」との要望を受けた。
+
+  「クロップ領域」の定義:
+    GPXHandler._raw_time_range()（4-6節、has_overlap()と共通のロジック）
+    が、動画のStart/End・オフセット・タイムラプス倍率から算出する
+    「出力範囲に対応するGPX記録時刻の範囲」を基準とする。この範囲外の
+    GPXポイントが「クロップされる領域（＝動画のタイムスタンプから
+    外れている領域）」であり、Start/Endのトリミングとタイムスタンプの
+    ずれの両方を単一の概念として扱っている（ユーザーの要望文にある
+    「クロップ領域」と「タイムスタンプから外れている領域」は、
+    実装上は同じ_raw_time_range()判定の裏表であるため、区別せず
+    1つのin_rangeフラグとして表現する）。
+
+  実装:
+    - GPXHandler.classify_points_in_range()（4-6節）:
+      get_all_points()と同じ順序でin_range: list[bool]を返す
+    - MapWidget.update_route_ranges(in_range)（4-2節）:
+      JS側のupdateRouteRanges()を呼ぶ
+    - map_template.html（9章）: loadRoute()はcurrentLatLngsに緯度経度を
+      保持するよう変更（Start/End操作のたびに全点を再送しないため）。
+      updateRouteRanges(inRangeFlags)は、隣接する点のinRangeFlagが
+      切り替わる箇所でセグメントに分割し、区間ごとに再描画する
+      （splitIntoSegments()。セグメントの継ぎ目が視覚的に途切れない
+      よう、直前の点を新セグメントの先頭にも含める）
+    - 配色: 範囲内は従来通り緑の太線（#16a34a、weight 3）。範囲外は
+      グレーの太線（#6b7280、weight 3）
+      （実機でLeafletの実ページに対しrunJavaScript()を実行し、
+      routeSegmentsの長さ・各セグメントの色/太さ/点数が意図通りに
+      なることを検証済み）
+    - MainWindow._update_route_range_highlight()（4-1節）: GPX・動画の
+      両方が読み込み済みの場合のみclassify_points_in_range()→
+      update_route_ranges()を呼ぶ。on_start_changed() / on_end_changed() /
+      on_offset_changed() / on_duration_changed() / on_timelapse_changed()
+      から呼ばれ、Start/End・オフセット・タイムラプス設定の変更の
+      たびに塗り分けを再計算する
+
+    配色の修正（2026-07-15、初版リリース直後）:
+      当初は範囲外を「太い緑の下地(weight5)+細いグレー(weight3)」の
+      重ね描きで「緑の枠線が覗くグレーの太線」として実装したが、
+      実際に表示すると縁取りの分だけ範囲外の線が範囲内より太く見えて
+      しまい、意図したイメージと異なるとのフィードバックを受けた。
+      縁取りを廃止し、範囲内と同じweight 3のグレー単色に変更した。
+
+
+21. 出力前のGPSカバレッジ確認・自動クロップ
+----------------------------------------------------------------
+
+  背景（spec.txt 5-6節）:
+    2026-07-15、ユーザーより「オフセット調整後、結果的にGPSデータの
+    ない動画フレームが存在する可能性があると思うが、その場合の処理は
+    どうなっているか」との質問を受けた。実装（GPXHandler.has_overlap()
+    ・_build_output_points()）とmapillary_tools側のソース
+    （.venv内のgeo.py、Interpolator._interpolate_at_segment_idx()）を
+    確認したところ、以下が判明した:
+      - has_overlap()は「Start-End全体がGPXの記録範囲でカバーされて
+        いるか」ではなく「少しでも重なっているか」という緩い判定
+        しか行っていない
+      - GPXHandler側の出力処理（_build_output_points()）は、GPXの
+        記録範囲外の境界について補間（_interpolate_at()）が失敗する
+        ため、単にその区間のデータを出力しない（エラー・警告なし）
+      - mapillary_tools側のInterpolatorは、CAMM等の点列の最初/最後の
+        点より前後の時刻について、明示的に直線外挿
+        （linear extrapolation）で位置を推定する
+        （_interpolate_at_segment_idx()の
+        "# Extrapolating before the first point" コメント参照）。
+        つまり処理自体は破綻しないが、実測ではなく推定値になる
+    この調査結果を受け、ユーザーから「警告を出し、同意が得られれば
+    GPSの無い動画部分をクロップする」という対応を依頼された。
+
+  実装:
+    - GPXHandler.clip_to_gps_coverage()（4-6節）: Start/EndをGPXの
+      実記録範囲にクロップした値を返す（クロップ不要ならそのまま返す）
+    - MainWindow._confirm_and_apply_gps_coverage_crop()（4-1節）:
+      GPX・動画未読み込み時、またはクロップ不要（既に完全カバー）の
+      場合は確認ダイアログを出さずTrueを返す。クロップが必要な場合は
+      QMessageBox.question()で
+      「GPSデータのない動画フレームが存在するため、動画をクロップ
+      します。よろしいですか？」（OK/キャンセル）を表示する:
+        OK: video_widget.timeline.set_start()/set_end()でシークバーの
+            表示を更新した上で、既存のon_start_changed()/
+            on_end_changed()（4-1節）を直接呼んでMainWindow側の
+            state・出力ボタン状態・20章のルート塗り分け表示も
+            連動して更新する。最後にvideo_widget.seek()で現在の
+            再生位置を新しいStart-End範囲にクランプし、Trueを返す
+        キャンセル: 何も変更せずFalseを返す
+    - on_export_clicked()（4-1節）: 冒頭で
+      _confirm_and_apply_gps_coverage_crop()を呼び、Falseなら
+      出力先ディレクトリ選択より前の時点で処理を中断する
+
+
+22. 出力ダイアログの保存ダイアログ化
+----------------------------------------------------------------
+
+  背景（spec.txt 5-6節）:
+    2026-07-15、ユーザーより「Export&Testをクリックした時開くダイアログの
+    実行ボタンが『Open』になっているんだけど、本来なら『保存』にしたいし、
+    ファイル名の入力もできるほうがいい。デフォルト名は今と変えずに」との
+    要望を受けた。従来はQFileDialog.getExistingDirectory()（フォルダ
+    選択専用ダイアログ）で出力先フォルダのみを選択し、動画・GPXの
+    ファイル名は両方ともExporter側で自動生成していたため、実行ボタンの
+    ラベルがQtの標準仕様で「Open」になっていた。
+
+  実装:
+    - QFileDialog.getExistingDirectory() → QFileDialog.getSaveFileName()
+      に変更（app/main_window.py on_export_clicked()）。実行ボタンは
+      OS標準の「保存」ラベルになる
+    - 初期表示ファイル名は Exporter.default_video_filename(state)
+      （app/exporter.py、新設）で、変更前と同じ命名規則
+      f"{元動画ファイル名}_synced.mp4" を返す
+    - フィルタは "MP4 Files (*.mp4)"
+    - Exporter.export()の第2引数を output_dir から video_output_path
+      （動画の保存先フルパス）に変更した。GPXファイルは
+      video_output_pathの親ディレクトリに、従来通り
+      generate_output_path()で自動生成した名前
+      （f"{元GPXファイル名}_synced.gpx"、重複時は連番付与）で出力する
+
+    仕様変更点（ユーザーへの事前説明・承認済み）:
+      動画ファイルは保存ダイアログでユーザーが明示的にパス・ファイル名を
+      指定する形になったため、従来あった「重複時は自動的に_2を付与する」
+      連番ロジックは動画には適用されなくなった。保存先に同名ファイルが
+      既にある場合は、OS標準の「上書きしますか？」確認ダイアログが
+      表示される（Save系ダイアログの一般的な挙動に合わせた）。GPX側の
+      自動連番ロジック（generate_output_path()）自体は変更していない。
+
+
+23. GPXデータの取得元統合・読み込み順序ルール撤廃・検証モード廃止
+----------------------------------------------------------------
+
+  背景（spec.txt 5-1節・5-12節）:
+    2026-07-15、ユーザーより「検証モードを導入した経緯があるが、
+    よくよく考えるとGPXと動画を一緒に読み込むだけで通常モードと
+    変わらないのでは」との指摘を受けた。実装（VerificationWindow.
+    open_video()）を確認したところ、実際にはGPXファイルを一切
+    読み込まず、動画自体に埋め込まれたCAMM GPSトラック
+    （camm_encoder.extract_gps_track()）を抽出して表示していることが
+    判明した。つまり検証モードが確認していたのは「動画に実際に
+    埋め込まれたGPSが正しいか」＝CAMM埋め込み処理自体の正しさで
+    あり、外部GPXファイルとの同期確認とは異なる目的だった。
+
+    ユーザーからの追加説明で、真の狙いは「CAMM埋め込み動画を読み込む
+    ことで、GPXデータと動画データの両方を内部的に読み込んだことに
+    してしまえば、以降の内部処理（マップ表示・オフセット調整・
+    出力）を通常モードと完全に共通化できるはず」という統合案だと
+    判明した。優先ルールについては、当初「明示的なGPXファイルが
+    常に優先」という非対称案を提示したが、ユーザーからの指摘により
+    「GPX・動画（のCAMM埋め込み）いずれの経路でも、最後に読み込んだ
+    GPS付きファイルが常に優先される」という対称なルールに変更した。
+
+  実装の骨子:
+    a) camm_encoder.extract_gps_track()（4-8節）がtime_gps_epoch
+       （実際の撮影時刻）を読み捨てずに返すよう変更（embed_gps_track()
+       と対称な5要素タプルに）。これにより動画埋め込みGPSからも
+       実時刻付きのGPXTrackPointを構築できるようになった
+    b) GPXHandler.from_camm_points()（4-6節、新設）で、CAMM抽出点から
+       実時刻付きのGPXHandlerを構築する。以降は通常のGPXHandler
+       パイプラインをそのまま使い回せる（interpolate_position/
+       has_overlap/classify_points_in_range/export_trimmed等）
+    c) MainWindow._apply_gps_source()（4-1節、新設）で、GPXファイル
+       読み込み・動画のCAMM埋め込み抽出のいずれの経路でも、
+       state.gpx_handler/gpx_path/gpx_dataを無条件で上書きする
+       共通処理に統一。呼ばれるたびに上書きすることで「最後勝ち」
+       ルールを実現している
+    d) MainWindow.load_video()の末尾近くで_try_load_embedded_gps()
+       （4-1節、新設）を呼び、CAMM埋め込みがあれば自動的に
+       _apply_gps_source()を呼ぶ。埋め込みが無い動画の場合は
+       早期returnし、既存のGPXデータには一切触れない
+    e) load_gpx()・load_video()双方の「相手が先に読み込まれている
+       必要がある」というガード（QMessageBox警告＋return）を撤廃
+       （4-1節）。open_video_action/open_video_buttonも常時enabled
+       にし、_update_open_button_emphasis()の判定もGPX・動画で
+       独立させた（17章の強調表示ロジックを23章向けに調整）
+    f) dragEnterEvent/dropEvent（4-1節）も、拡張子が".gpx"以外は
+       常にload_video()を試みるよう簡略化。「GPX未読み込み時は動画の
+       ドロップを拒否する」という分岐を撤廃した
+    g) _prompt_creation_time()（4-1節）のgpx_handler前提のassertを
+       撤廃し、未読み込み時は現在時刻をデフォルトにフォールバックする
+       よう変更（動画がGPXより先に読み込まれるケースに対応）
+    h) VerificationWindow（app/verification_window.py）・
+       interpolate_camm_points()（camm_encoder.py）・
+       「ツール」メニュー・tests/test_verification_window.pyを削除
+       （4-8節・4-10節）
+
+  マップマッチングとの関係（5-9節）:
+    動画のCAMM埋め込みから採用したGPSデータには、マップマッチング
+    （5-9節・4-11節）を適用しない。既に処理済みの実走行データ
+    （多くの場合、本ツール自身が過去にエクスポートした動画に
+    埋め込んだもの、または既にマップマッチング済みの状態で
+    埋め込まれたもの）であり、外部GPSデバイスの生データとは性質が
+    異なるため。ステータス表示（左カード、5-9節と同じ場所）も
+    データの出所に応じて文言を切り替える
+    （_update_gps_source_status_for_camm()、4-1節。「✓ 動画に
+    埋め込まれたGPSデータを使用（◯点）」）。マップマッチング結果
+    表示（_update_map_matching_status()）と同じ
+    _set_map_matching_status_label()共通ヘルパー（4-1節、新設）で
+    テキスト・状態色（state="ok"/"warn"/"error"）・ツールチップを
+    まとめて設定する。
+
+  バージョン: 読み込み順序ルールの撤廃・検証モードの廃止という
+  破壊的仕様変更のため、メジャー更新（0.20.1 → 1.0.0）とした。
+
+  副次的に発見・修正した不具合（2026-07-15、リリース直後）:
+    ユーザーが実際にエクスポート済みの動画（本ツール自身が過去に
+    出力したCAMM埋め込み動画）を単体で読み込んだところ、マップ上の
+    ルート線が全区間グレー（範囲外）表示になり、動画を再生しても
+    マーカーが一切動かない不具合が報告された。
+
+    原因調査（実機検証。ffprobeで問題の動画ファイルを直接確認）:
+    MP4Boxでトラック（CAMM）を追加すると、動画コンテナのcreation_time
+    メタデータ（format.tags.creation_time）が「MP4Boxを実行した
+    処理実行時刻」で上書きされてしまうことを実機で再確認した
+    （4-8節「制約3」に既存の既知事項として記載していたが、これまでは
+    mapillary_toolsへの--video_start_time明示指定でのみ対策しており、
+    本ツール自身がVideoHandler.get_creation_time()経由でこの値を
+    信用してstate.video_creation_timeに設定する経路
+    （_try_load_embedded_gps()、上記d)）については対策していなかった。
+    23章の新機能で初めてこの経路が使われるようになったため、これまで
+    表面化していなかった）。
+    実機で合成テストデータ（sample_420p.mp4にCAMM埋め込み）を作成し
+    再現したところ、埋め込み直後のCAMM済み動画のcreation_timeが
+    テスト実行時刻（例: "2026-07-15T13:11:51.000000Z"）に化けており、
+    元の動画自身の実際の撮影時刻（"2026-07-12T01:00:00.000000Z"）とは
+    無関係な値になっていることを確認した。この誤ったcreation_timeを
+    state.video_creation_timeとして使うと、raw_time_range()の計算
+    全体が数日分ずれてしまい、GPX（CAMM由来）の全記録点が
+    Start-End範囲外（classify_points_in_range()が全てFalse）・
+    interpolate_position()の記録範囲外（Noneを返す）判定になっていた。
+
+    修正: _try_load_embedded_gps()内で、CAMM抽出点のうち
+    relative_msが最小（通常は0、動画の先頭フレームに対応）の点の
+    epoch_timeを、state.video_creation_timeとして直接採用するよう
+    変更した（ffprobe由来の値を上書きする）。CAMMデータ自身が
+    「動画再生位置0msに対応する実時刻」を正確に保持しているため、
+    コンテナメタデータより信頼できる情報源として扱う。この方針は
+    本ツール自身がエクスポートした動画に限らず、任意のCAMM埋め込み
+    動画に対して一般に妥当な設計（コンテナレベルのcreation_timeは
+    秒単位精度に留まりがちで、各種ツールによる上書きの影響も
+    受けやすいため、CAMMのepoch_timeの方が本質的に精度・信頼性が
+    高い）と判断した。
+    tests/test_main_window.pyに回帰テスト
+    （test_camm_video_creation_time_uses_embedded_epoch_not_corrupted_metadata）
+    を追加し、CAMM埋め込み動画読み込み後にstate.video_creation_time
+    が正しいepoch由来の値になること、classify_points_in_range()が
+    全区間Trueになること、interpolate_position()がNoneを返さない
+    ことを確認した。
 
 ================================================================
                               以上

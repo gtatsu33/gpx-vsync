@@ -17,13 +17,61 @@
         attribution: '&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors'
     }).addTo(map);
 
-    var routeLine = null;
+    var currentLatLngs = [];
+    var routeSegments = [];
     var marker = null;
 
+    function clearRouteSegments() {
+        routeSegments.forEach(function(line) { map.removeLayer(line); });
+        routeSegments = [];
+    }
+
+    function splitIntoSegments(latlngs, inRangeFlags) {
+        var segments = [];
+        var current = null;
+        for (var i = 0; i < latlngs.length; i++) {
+            var flag = inRangeFlags[i];
+            if (!current || current.inRange !== flag) {
+                if (current) segments.push(current);
+                current = {inRange: flag, latlngs: []};
+                // セグメントの継ぎ目で線が途切れないよう、前の点も含める
+                if (i > 0) current.latlngs.push(latlngs[i - 1]);
+            }
+            current.latlngs.push(latlngs[i]);
+        }
+        if (current) segments.push(current);
+        return segments;
+    }
+
+    function renderRouteSegments(inRangeFlags) {
+        clearRouteSegments();
+        if (currentLatLngs.length === 0) return;
+        var segments = splitIntoSegments(currentLatLngs, inRangeFlags);
+        segments.forEach(function(seg) {
+            if (seg.inRange) {
+                routeSegments.push(
+                    L.polyline(seg.latlngs, {color: '#16a34a', weight: 3}).addTo(map)
+                );
+            } else {
+                // クロップされる領域: 緑の縁取りは付けず、範囲内と同じ
+                // 太さのグレー単色にする
+                routeSegments.push(
+                    L.polyline(seg.latlngs, {color: '#6b7280', weight: 3}).addTo(map)
+                );
+            }
+        });
+    }
+
     function loadRoute(latlngs) {
-        if (routeLine) map.removeLayer(routeLine);
-        routeLine = L.polyline(latlngs, {color: 'blue', weight: 3}).addTo(map);
-        map.fitBounds(routeLine.getBounds());
+        currentLatLngs = latlngs;
+        renderRouteSegments(latlngs.map(function() { return true; }));
+        if (latlngs.length > 0) {
+            map.fitBounds(L.latLngBounds(latlngs));
+        }
+    }
+
+    function updateRouteRanges(inRangeFlags) {
+        renderRouteSegments(inRangeFlags);
     }
 
     function updateMarker(lat, lon) {
@@ -46,7 +94,8 @@
     }
 
     function clearMap() {
-        if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+        clearRouteSegments();
+        currentLatLngs = [];
         if (marker) { map.removeLayer(marker); marker = null; }
     }
   </script>

@@ -99,8 +99,12 @@ def embed_gps_track(
             )
 
 
-def extract_gps_track(video_path: str) -> list[tuple[int, float, float, float]]:
-    """embed_gps_track() の逆操作。CAMMトラックが見つからない場合は
+def extract_gps_track(
+    video_path: str,
+) -> list[tuple[int, float, float, float, float]]:
+    """embed_gps_track() の逆操作。戻り値は(relative_ms, latitude,
+    longitude, elevation, epoch_time)で、embed_gps_track()の入力形式と
+    対称になっている。CAMMトラックが見つからない場合は
     CammTrackNotFoundError を送出する。"""
     _require_mp4box()
 
@@ -153,19 +157,18 @@ def _find_camm_track_id(info_output: str) -> int | None:
 
 def _parse_nhml_camm(
     nhml_path: str, media_path: str
-) -> list[tuple[int, float, float, float]]:
+) -> list[tuple[int, float, float, float, float]]:
     """embed_gps_track()で埋め込んだCAMM Type 6(GPS)サンプルを読み戻す。
-    time_gps_epoch等の付加情報は(相対ミリ秒ベースのプレビュー表示にしか
-    使わないVerificationWindow等の既存用途では不要なため)ここでは
-    読み捨て、embed_gps_track()以前と同じ(relative_ms, lat, lon, elevation)
-    の4要素タプルを返す。"""
+    time_gps_epoch（実際の撮影時刻、UTC epoch秒）も含めて返す
+    （22章。動画に埋め込まれたGPSデータをGPXデータ相当として
+    取り込む際、実時刻付きのGPXTrackPointを構築するために必要）。"""
     tree = ET.parse(nhml_path)
     root = tree.getroot()
 
     with open(media_path, "rb") as f:
         media_data = f.read()
 
-    points: list[tuple[int, float, float, float]] = []
+    points: list[tuple[int, float, float, float, float]] = []
     offset = 0
     for sample in root.findall("NHNTSample"):
         dts = int(sample.get("DTS"))
@@ -175,7 +178,7 @@ def _parse_nhml_camm(
         (
             _reserved,
             _type,
-            _time_gps_epoch,
+            time_gps_epoch,
             _gps_fix_type,
             lat,
             lon,
@@ -187,37 +190,6 @@ def _parse_nhml_camm(
             _velocity_up,
             _speed_accuracy,
         ) = CAMM_GPS_TYPE6_STRUCT.unpack(chunk)
-        points.append((dts, lat, lon, elevation))
+        points.append((dts, lat, lon, elevation, time_gps_epoch))
 
     return points
-
-
-def interpolate_camm_points(
-    points: list[tuple[int, float, float, float]], video_time_ms: int
-) -> tuple[float, float] | None:
-    """points（relative_msでソート済み前提）から、video_time_ms時点の
-    緯度経度を線形補間で返す。範囲外は None。"""
-    if not points:
-        return None
-    if video_time_ms < points[0][0] or video_time_ms > points[-1][0]:
-        return None
-
-    lo, hi = 0, len(points) - 1
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if points[mid][0] < video_time_ms:
-            lo = mid + 1
-        else:
-            hi = mid
-    after = points[lo]
-    if after[0] == video_time_ms or lo == 0:
-        return after[1], after[2]
-    before = points[lo - 1]
-
-    span = after[0] - before[0]
-    if span <= 0:
-        return before[1], before[2]
-    ratio = (video_time_ms - before[0]) / span
-    lat = before[1] + (after[1] - before[1]) * ratio
-    lon = before[2] + (after[2] - before[2]) * ratio
-    return lat, lon
