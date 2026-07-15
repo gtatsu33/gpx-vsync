@@ -1,0 +1,565 @@
+================================================================
+  Video-GPX Sync Tool - 実装ステップ・テスト計画
+  版数: 1.3  作成日: 2026-07-12  更新日: 2026-07-13
+================================================================
+
+1. 実装方針
+----------------------------------------------------------------
+
+  GUI依存の少ないロジック層から実装し、最後にGUIで結線する
+  「ボトムアップ」の順序で進める。
+
+  理由:
+    ロジック層（GPX処理・ffmpeg呼び出し）は自動テストを書きやすく、
+    先に固めておくとGUI統合時のデバッグが容易になるため。
+
+
+2. 実装ステップ
+----------------------------------------------------------------
+
+  Step 0: プロジェクト基盤
+    - ディレクトリ構成の作成（implement.txt 3節）
+    - requirements.txt / requirements-dev.txt の作成
+    - main.py 雛形（起動時のffmpeg存在チェック → 無ければダイアログ表示）
+    対応implement.txtセクション: 3, 12
+
+  Step 1: GPXHandler（app/gpx_handler.py）
+    - load(path) -> gpxpy.GPX
+    - get_all_points()（全トラック・全セグメントを時刻順に結合）
+    - interpolate_position(video_time_ms, offset_sec, video_start_ms)
+      （線形補間、範囲外はNone）
+    - export_trimmed()（境界時刻の補間ポイント追加込みでGPX 1.1書き出し）
+    対応implement.txtセクション: 4-6
+
+  Step 2: VideoHandler（app/video_handler.py）
+    - get_metadata(path)（ffprobe: 動画長・creation_time取得）
+    - get_keyframe_timestamps(path)（ffprobe: キーフレーム位置一覧）
+    - export_trimmed()（Smart Cut方式: 区間A/B/C + concat）
+    対応implement.txtセクション: 4-7
+
+  Step 3: Exporter（app/exporter.py）
+    - Step1・Step2の統合
+    - 出力ファイル名生成（`_synced`サフィックス、重複時は自動連番）
+    - can_export()（GPXとオフセット適用後の時刻範囲が
+      動画Start〜Endと重複するかの判定）
+    対応implement.txtセクション: 4-8
+
+  Step 4: MapWidget（app/map_widget.py）
+    - QWebEngineView + Leaflet.js 連携
+    - load_gpx_route() / update_marker() / hide_marker() / clear()
+    対応implement.txtセクション: 4-2, 9
+
+  Step 5: VideoWidget + CustomTimeline（app/video_widget.py）
+    - QMediaPlayer + QVideoWidget による再生・停止・シーク
+    - CustomTimeline: Start/Endハンドルのドラッグ、
+      現在位置がEndに達したら一時停止してEnd位置に固定
+    対応implement.txtセクション: 4-3, 4-4, 7
+
+  Step 6: OffsetWidget（app/offset_widget.py）
+    - ±1秒/±10秒/±1分/±10分ボタン、リセットボタン
+    - オフセット表示ラベル、offset_changedシグナル
+    対応implement.txtセクション: 4-5
+
+  Step 7: MainWindow統合（app/main_window.py）
+    - 全ウィジェットの配線、AppState管理
+    - GPX未読み込み時は動画読み込みUIを無効化する制御
+    - 出力ボタンの有効/無効制御（can_export()と連動）
+    対応implement.txtセクション: 4-1, 5, 8
+
+  Step 8: E2E動作確認・mapillary_tools連携確認
+    - 実際のGPX・動画ファイルを使った一連の操作の手動確認
+    - 出力したGPX/MP4をmapillary_toolsコマンドに渡して動作確認
+    対応implement.txtセクション: 10
+
+  Step 9: CAMM対応・検証モード
+    9-1. GPXHandler拡張（app/gpx_handler.py）
+      - _build_output_points() 共通ヘルパー抽出
+        （既存export_trimmedの境界補間ロジックを再利用）
+      - get_points_for_camm(video_start_ms, video_end_ms, offset_sec,
+        video_creation_time) -> list[tuple[int, float, float, float]]
+      対応implement.txtセクション: 4-6
+
+    9-2. CammEncoder新規実装（app/camm_encoder.py）
+      - embed_gps_track(video_path, output_path, points)
+        （CAMM Type5バイナリ生成 + NHMLマニフェスト + MP4Box -add）
+      - extract_gps_track(video_path) -> list[tuple[int, float, float, float]]
+        （MP4Box -info でcammトラックID特定 → MP4Box -nhml で書き出し→パース）
+      - interpolate_camm_points(points, video_time_ms) -> tuple[float, float] | None
+      対応implement.txtセクション: 4-8
+
+    9-3. Exporterパイプライン更新（app/exporter.py）
+      - MAPILLARY_TOOLS_COMMAND_TEMPLATE を --geotag_source camm に変更
+        （--geotag_source_path を削除）
+      - export() に CAMM埋め込みステップを追加
+        （VideoHandler.export_trimmed → GPXHandler.get_points_for_camm
+         → CammEncoder.embed_gps_track の順で実行。ffmpeg処理は
+         CAMM埋め込みより前に完了させ、埋め込み後はffmpeg処理を行わない）
+      対応implement.txtセクション: 4-9, 10
+
+    9-4. VerificationWindow新規実装（app/verification_window.py）
+      - MapWidget + VideoWidget を流用した独立ウィンドウ
+      - open_video(path)（extract_gps_track → 未検出ならエラー表示
+        → load_gpx_route → video読み込み）
+      - positionChanged → interpolate_camm_points → update_marker/hide_marker
+      - closeEvent（QMediaPlayer破棄前クリーンアップ、Step5と同パターン）
+      対応implement.txtセクション: 4-10
+
+    9-5. MainWindowメニュー追加（app/main_window.py）
+      - 「ツール」→「検証モードを開く...」→ VerificationWindow生成・show()
+      対応implement.txtセクション: 4-1
+
+    9-6. main.py起動チェック更新
+      - MP4Box（GPAC）の存在チェックを追加、無ければダイアログ表示
+      対応implement.txtセクション: 11
+
+  Step 10: マップマッチング（GPX読み込み時）
+    10-1. MapMatcher新規実装（app/map_matcher.py）
+      - rdp_mask / rdp_simplify（Douglas-Peucker、../gpx-editorの
+        rdp.jsを移植、epsilon=0.00005）
+      - match_chunk（Valhalla trace_attributes へのPOST、
+        costing=bicycle、search_radius=50、timeout=30秒、
+        X-Client-Idヘッダー付与）
+      - apply_matched_points（matched/interpolatedのみ座標置換）
+      - match_route（50点チャンク処理、進捗コールバック・キャンセル・
+        1チャンク目失敗時の自動キャンセル・2チャンク目以降の
+        部分継続、../gpx-editorのmapMatching.jsを移植）
+      - match_gpx_points（gpxpy連携アダプタ。時刻・標高を保持しつつ
+        座標のみ置換）
+      対応implement.txtセクション: 4-11, 13
+
+    10-2. MapMatchingWorker / MapMatchingDialog新規実装
+      （app/map_matching_worker.py, app/map_matching_dialog.py）
+      - QThreadでmatch_gpx_points()をバックグラウンド実行
+      - progress/finished_matchingシグナル、request_cancel()
+      - プログレスバー＋キャンセルボタンのモーダルダイアログ
+      対応implement.txtセクション: 4-12
+
+    10-3. GPXHandler拡張（app/gpx_handler.py）
+      - replace_points(points)：self.gpxを単一トラック・単一
+        セグメントに作り直して置き換える
+      対応implement.txtセクション: 4-6
+
+    10-4. MainWindow統合（app/main_window.py）
+      - load_gpx()にマップマッチングのワーカー起動・ダイアログ表示・
+        replace_points()呼び出しを追加
+      対応implement.txtセクション: 4-1
+
+    10-5. 依存パッケージ追加
+      - requirements.txtに requests を追加
+      対応implement.txtセクション: 1, 12
+
+  Step 11: 出力後ローカル検証（mapillary_tools連携）
+    11-1. MapillaryValidator新規実装（app/mapillary_validator.py）
+      - is_mapillary_tools_available()
+      - validate_export(video_path, video_start_time, should_cancel)
+        （mapillary_tools video_processをsubprocess.Popenで実行、
+        サンプル画像出力先は一時ディレクトリへ、desc.jsonをパース、
+        ERROR/WARNINGログ行を抽出）
+      対応implement.txtセクション: 4-13
+
+    11-2. MapillaryValidationWorker / MapillaryValidationDialog新規実装
+      （app/mapillary_validation_worker.py,
+       app/mapillary_validation_dialog.py）
+      - QThreadでvalidate_export()をバックグラウンド実行
+      - finished_validationシグナル、request_cancel()
+      - 不定形プログレスバー＋キャンセルボタンのモーダルダイアログ
+      対応implement.txtセクション: 4-14
+
+    11-3. MainWindow統合（app/main_window.py）
+      - 出力ボタンのラベルを「📤 Export & Test」に変更
+      - on_export_clicked()にexport()完了後の検証ワーカー起動・
+        ダイアログ表示・完了メッセージへの結果追記を追加
+      対応implement.txtセクション: 4-1
+
+  Step 12: タイムラプス動画対応（フェーズ1: プレビュー同期・再生レート）
+    12-1. time_utils新規実装（app/time_utils.py）
+      - playback_ms_to_real_ms(ms, time_scale)
+      対応implement.txtセクション: 4-15, 15
+
+    12-2. AppState拡張（app/state.py）
+      - video_time_scale: float = 1.0 を追加
+      対応implement.txtセクション: 4-1
+
+    12-3. VideoHandler拡張（app/video_handler.py）
+      - has_audio_stream(path)：音声トラック無し検知
+        （タイムラプスの可能性を示す弱いヒント判定用）
+      対応implement.txtセクション: 4-7, 15
+
+    12-4. TimelapseWidget新規実装（app/timelapse_widget.py）
+      - チェックボックス＋間隔入力（秒）、timelapse_changedシグナル
+      - reset()：動画差し替え時に初期状態へ戻す
+      対応implement.txtセクション: 4-16
+
+    12-5. GPXHandler拡張（app/gpx_handler.py）
+      - interpolate_position()にvideo_time_scale引数を追加
+        （デフォルト1.0で従来と同じ挙動）
+      対応implement.txtセクション: 4-6, 15
+
+    12-6. MainWindow統合（app/main_window.py）
+      - load_video()でfpsキャッシュ・タイムラプス設定リセット・
+        音声トラック無し時のヒント表示を追加
+      - on_timelapse_changed()・_apply_playback_rate()を新規実装
+      - on_position_changed()・on_force_sync_clicked()に
+        video_time_scaleを反映
+      - _update_export_button_state()でタイムラプス有効時に
+        出力ボタンを無効化（フェーズ2で撤廃。Step 13参照）
+      対応implement.txtセクション: 4-1, 15
+
+  Step 13: タイムラプス動画対応（フェーズ2: CAMM Type6・Mapillary連携）
+    13-1. time_utils拡張（app/time_utils.py）
+      - real_ms_to_playback_ms(real_ms, time_scale)：
+        playback_ms_to_real_ms()の逆変換
+      対応implement.txtセクション: 4-15, 15
+
+    13-2. CammEncoder変更（app/camm_encoder.py）
+      - CAMM Type 5(MIN_GPS) → Type 6(GPS)へ変更、
+        time_gps_epochフィールドを追加
+      - embed_gps_track()の引数を(relative_ms, lat, lon, elevation,
+        epoch_time)の5要素タプルに変更
+      - extract_gps_track()はType6を読みつつ、戻り値は従来通り
+        4要素タプル（VerificationWindow等の既存用途との互換性維持）
+      対応implement.txtセクション: 4-8, 15
+
+    13-3. GPXHandler拡張（app/gpx_handler.py）
+      - export_trimmed() / get_points_for_camm() /
+        _build_output_points() / _raw_time_range() / has_overlap()
+        全てにvideo_time_scale引数（デフォルト1.0）を追加
+      - get_points_for_camm()の戻り値にepoch_timeを追加、relative_ms
+        はreal_ms_to_playback_ms()で動画のネイティブ位置に逆変換
+      対応implement.txtセクション: 4-6, 15
+
+    13-4. Exporter変更（app/exporter.py）
+      - can_export()/export()/get_video_start_time_str()に
+        state.video_time_scaleを反映
+      - MAPILLARY_TOOLS_COMMAND_TEMPLATEを
+        `--geotag_source exif --video_sample_distance 3
+        --video_sample_interval -1` に変更
+      対応implement.txtセクション: 4-9, 10, 15
+
+    13-5. MapillaryValidator変更（app/mapillary_validator.py）
+      - validate_export()内のsubprocessコマンドを同様に変更
+      対応implement.txtセクション: 4-13, 15
+
+    13-6. MainWindow変更（app/main_window.py）
+      - _update_export_button_state()のタイムラプス強制無効化を撤廃
+      対応implement.txtセクション: 4-1, 11, 15
+
+  Step 14: タイムラプス設定UIの視認性改善
+    14-1. MainWindow変更（app/main_window.py）
+      - _prompt_timelapse_settings(has_audio) を新規実装:
+        動画読み込み時（メニュー・ドラッグ&ドロップ両方）に毎回表示する
+        確認ダイアログ。音声トラック無し時のヒント統合、チェックボックス
+        ＋間隔入力、OKボタンのみ
+      - load_video() から呼び出し、戻り値を常設のtimelapse_widgetに反映
+      - 旧: 音声トラック無し時のQMessageBox.information単独表示は廃止
+        （本ダイアログに統合）
+      対応implement.txtセクション: 4-1, 15
+
+  Step 15: 再生操作性の改善（シークバードラッグ・一時停止化）
+    15-1. CustomTimeline変更（app/video_widget.py）
+      - mousePressEvent/mouseMoveEventにドラッグモード"position"を追加。
+        Start/Endハンドル以外の場所を押してドラッグすると、
+        mouseMoveEventのたびに連続してseek_requestedを発火する
+        （スクラブ操作。以前は押した瞬間の1回しかシークできなかった）
+      対応implement.txtセクション: 4-4
+
+    15-2. MainWindow変更（app/main_window.py）
+      - stop_button → pause_button に変更、ラベルを
+        「⏹ 停止」→「⏸ 一時停止」に変更
+      - on_stop_clicked() → on_pause_clicked() に変更、
+        Startマーカーへのシークを削除し一時停止のみ行う
+      対応implement.txtセクション: 4-1, 8
+
+  Step 16: マップマッチングのRDP間引き廃止・fair-use対応レート制限
+    16-1. MapMatcher変更（app/map_matcher.py）
+      - rdp_mask/rdp_simplify/RDP_EPSILON/_perpendicular_distanceを削除
+      - match_gpx_points()を全点そのままmatch_route()に渡す実装に変更
+        （間引き無し、kept_indicesによるインデックス付け替えも不要に）
+      - match_route()にMIN_REQUEST_INTERVAL_SEC=1.0のレート制限を追加。
+        チャンク送信間隔がsleep_impl(DI可能)経由で1秒を下回らないよう
+        待機する（fair-use対応）
+      対応implement.txtセクション: 4-11, 13
+
+
+3. テスト方針
+----------------------------------------------------------------
+
+  Step 1: GPXHandler
+    種別: pytest によるユニットテスト
+    - テスト用の小さいGPXファイルを用意する
+    - 複数トラック/セグメントが時刻順に正しく結合されるか
+    - interpolate_position が既知の2点間で正しい線形補間結果を
+      返すか
+    - GPXの記録範囲外の時刻に対して None を返すか
+    - export_trimmed が境界（Start/End）を正しく補間して追加し、
+      出力GPXが妥当なGPX 1.1形式か（gpxpyで再読込して検証）
+
+  Step 2: VideoHandler
+    種別: 実際の短いサンプル動画（数秒〜数十秒、テスト用に用意）を
+         使った統合テスト
+    - メタデータ（動画長・creation_time）取得が正しいか
+    - キーフレーム位置の取得が正しいか
+    - Smart Cut出力の動画長・Start/Endが指定通りか
+      （ffprobeで出力ファイルを再検証）
+    - 境界がキーフレームにちょうど一致する場合
+      （区間A or 区間Cが不要になるケース）の分岐が正しいか
+    - ffmpeg不在時・入力ファイル不正時のエラーハンドリング
+    注記: ffmpeg実行が絡むため、CI環境にffmpegが無い場合は
+         スキップできるようにする（pytest.mark.skipif等）
+
+  Step 3: Exporter
+    種別: pytest によるユニットテスト
+    - ファイル名生成ロジック（重複時の自動連番）
+    - can_export() の時刻範囲重複判定ロジック
+    - VideoHandler / GPXHandler の呼び出し部分はモック化し、
+      Exporter自体のロジックのみを検証する
+      （ffmpeg/gpxpyの実処理はStep1・Step2のテストで担保済み）
+
+  Step 4: MapWidget
+    種別: 手動確認中心（可能な範囲でpytest-qt併用）
+    - ルート描画、マーカー更新・非表示の見た目確認
+    - ネットワーク遮断時にマップ無表示でも動作継続するか確認
+    - 可能であれば runJavaScript に渡す文字列が期待通り
+      生成されているかを自動テストで検証
+
+  Step 5: VideoWidget + CustomTimeline
+    種別: pytest-qt によるウィジェットテスト＋手動確認
+    - Start/Endハンドルのドラッグ判定（10px以内）
+    - Start >= End にならない制約
+    - 現在位置がEndに達したら一時停止しEnd位置に固定される挙動
+    - 実際の動画ファイルでの再生・シーク操作感は手動確認
+
+  Step 6: OffsetWidget
+    種別: pytest-qt によるウィジェットテスト
+    - 各ボタン押下で offset_changed が正しい値
+      （±1, ±10, ±60, ±600 秒）で発火するか
+    - リセットボタンで0に戻るか
+
+  Step 7: MainWindow統合
+    種別: 手動確認中心（E2E）
+    - GPX未読み込み時に動画読み込みUIが無効化されているか
+    - GPX読み込み後に動画読み込みが可能になるか
+    - 時刻範囲が重複しない場合に出力ボタンが無効化されるか
+    - オフセット調整がマップマーカーにリアルタイム反映されるか
+
+  Step 8: E2E・mapillary_tools連携
+    種別: 手動確認
+    - 実際のGPX・動画ファイルを使い、読み込み→同期調整→出力の
+      一連の流れを確認
+    - 出力ファイルをmapillary_toolsコマンドに渡して問題なく
+      処理されるか確認
+
+  Step 9-1: GPXHandler拡張
+    種別: pytest ユニットテスト
+    - get_points_for_camm が境界補間込みで正しい点列を返すか
+    - 既存export_trimmedのテストが引き続き通るか（リファクタ後の回帰確認）
+
+  Step 9-2: CammEncoder
+    種別: 実際のサンプル動画・MP4Boxを使った統合テスト
+    - embed_gps_track → extract_gps_track の往復一致確認
+    - camm未埋め込み動画に対するextract_gps_trackのエラー/空リスト挙動
+    - interpolate_camm_pointsの補間結果・範囲外None確認
+    注記: MP4Box不在時はスキップできるようにする
+
+  Step 9-3: Exporter更新
+    種別: pytest ユニットテスト（モック中心）＋実データでの結合確認
+    - build_mapillary_tools_command が新テンプレート
+      （--geotag_source camm、--geotag_source_pathなし）を返すか
+    - export()がVideoHandler.export_trimmed → CammEncoder.embed_gps_track
+      の順で呼ばれるか（モックのcall順序検証）
+    - 実データでE2E: 出力動画をmapillary_tools video_processに通し、
+      GPSが正しく読めるか確認（Step8で既に実施済みの手順を再利用）
+
+  Step 9-4: VerificationWindow
+    種別: pytest-qt ウィジェットテスト＋手動確認
+    - GPSトラック無し動画読み込み時のエラー表示
+    - GPSトラックあり動画でのマーカー追従（interpolate_camm_points呼び出し確認）
+    - closeEvent時のQMediaPlayerクリーンアップ（ハング回避）
+
+  Step 9-5/9-6: 手動確認
+    - メニューからVerificationWindowが独立して開き、MainWindow状態に
+      影響しないか
+    - MP4Box不在環境での起動時エラーダイアログ表示確認
+
+  Step 10-1: MapMatcher
+    種別: pytest ユニットテスト（座標のみを扱う純粋ロジックはネットワーク
+         不要でテスト、match_chunkのみ実際のValhalla APIへの疎通確認）
+    - rdp_mask/rdp_simplifyが既知の点列（直線・ジグザグ）で期待通り
+      間引くか
+    - apply_matched_pointsがmatched/interpolated/unmatchedを
+      正しく仕分けるか
+    - match_routeがmatch_chunk_implを注入したモックで、進捗コールバック・
+      キャンセル・1チャンク目失敗時の自動キャンセル・2チャンク目以降の
+      部分継続を正しく行うか
+    - match_gpx_pointsが時刻・標高を保持したまま座標のみ置換するか
+    - match_chunkは実際にValhalla API（valhalla1.openstreetmap.de）へ
+      1回だけ疎通確認する統合テストを用意する（ネットワーク不通時は
+      スキップ可能にする）
+
+  Step 10-2: MapMatchingWorker / MapMatchingDialog
+    種別: pytest-qt ウィジェットテスト
+    - ワーカー完了でfinished_matchingシグナルが正しい結果で発火するか
+    - request_cancel()後の処理継続がキャンセル扱いになるか
+    - ダイアログのキャンセルボタンがworker.request_cancel()を呼ぶか
+
+  Step 10-3: GPXHandler拡張
+    種別: pytest ユニットテスト
+    - replace_points()後、get_all_points()等の既存メソッドが
+      正しく動作するか（回帰確認）
+
+  Step 10-4: MainWindow統合
+    種別: pytest-qt ウィジェットテスト＋手動確認
+    - load_gpx()がワーカー起動→ダイアログ表示→replace_points()の
+      順で呼ばれるか（実ネットワーク呼び出しはモック化）
+    - 実際のGPXファイルでの手動確認（道路への吸着が目視できるか）
+
+  Step 11-1: MapillaryValidator
+    種別: 実際のmapillary_toolsを使った統合テスト
+    - GPS付き動画でok=True・n_images>0が返るか
+    - GPSなし動画（camm未埋め込み）でok=False・エラーメッセージが
+      返るか（終了コード3・desc.json未生成のケース）
+    - should_cancel()がTrueを返した時点でプロセスがterminateされるか
+    - mapillary_tools不在時にis_mapillary_tools_available()がFalseを
+      返すか
+    注記: mapillary_tools不在時はスキップできるようにする
+
+  Step 11-2: MapillaryValidationWorker / MapillaryValidationDialog
+    種別: pytest-qt ウィジェットテスト
+    - ワーカー完了でfinished_validationシグナルが正しい結果で発火するか
+    - request_cancel()後の処理がキャンセル扱い（None）になるか
+    - ダイアログのキャンセルボタンがworker.request_cancel()を呼ぶか
+
+  Step 11-3: MainWindow統合
+    種別: pytest-qt ウィジェットテスト＋手動確認
+    - 出力ボタンのラベルが「📤 Export & Test」になっているか
+    - on_export_clicked()がexport()→検証ワーカー起動の順で呼ばれるか
+      （実mapillary_tools呼び出しはモック化）
+    - mapillary_tools不在環境で検証がスキップされ、出力自体は
+      成功するか
+    - 実際のGPX・動画ファイルでの手動確認（完了ダイアログに検証結果
+      が表示されるか）
+
+  Step 12-1: time_utils
+    種別: pytest ユニットテスト
+    - time_scale=1.0で恒等変換になるか
+    - タイムラプス相当のtime_scaleで正しく倍率変換されるか
+    - 四捨五入が正しく行われるか
+
+  Step 12-2: VideoHandler.has_audio_stream
+    種別: 実際のサンプル動画（ffmpegで音声トラックを除去した
+         テスト用動画を都度生成）を使った統合テスト
+    - 音声ありの動画でTrueが返るか
+    - 音声なしの動画でFalseが返るか
+    注記: ffmpeg不在時はスキップできるようにする
+
+  Step 12-3: TimelapseWidget
+    種別: pytest-qt ウィジェットテスト
+    - チェックボックスON/OFFでtimelapse_changedが正しい値で発火するか
+    - チェックがOFFの間は間隔入力欄の変更でシグナルが発火しないか
+    - reset()が中間状態を発火させず、最終状態(False, 既定値)を
+      1回だけ発火するか
+
+  Step 12-4: GPXHandler.interpolate_position（video_time_scale）
+    種別: pytest ユニットテスト
+    - video_time_scaleを指定した場合、実世界換算後の時刻で
+      補間した結果と一致するか
+    - デフォルト(1.0)指定時に従来の挙動と一致するか
+
+  Step 12-5: MainWindow統合
+    種別: pytest-qt ウィジェットテスト＋手動確認
+    - 動画読み込み時にfpsがキャッシュされ、video_time_scaleが
+      1.0にリセットされるか
+    - タイムラプス設定を有効化するとvideo_time_scale・再生レート
+      （playbackRate）・音声ミュート状態が正しく更新されるか。
+      無効化に戻すと元に戻るか
+    - 強制同期ボタンがvideo_time_scaleを考慮した計算をするか
+    - 音声トラックの無い動画を読み込むとヒントダイアログが
+      表示されるか
+    - 実際のタイムラプス動画ファイルでの手動確認（プレビューの
+      マーカー位置が実走と合うか、自動再生が見かけ上「間隔秒あたり
+      1フレーム」で再生されるか）
+
+  Step 13-1: time_utils.real_ms_to_playback_ms
+    種別: pytest ユニットテスト
+    - playback_ms_to_real_ms()との往復（逆変換）が一致するか
+
+  Step 13-2: CammEncoder（CAMM Type6）
+    種別: 実際のサンプル動画・MP4Boxを使った統合テスト
+    - embed_gps_track()（5要素タプル入力）→extract_gps_track()
+      （4要素タプル出力）の往復でrelative_ms/lat/lon/elevationが
+      一致するか（epoch_timeは読み捨てられる仕様であることを確認）
+    注記: MP4Box不在時はスキップできるようにする
+
+  Step 13-3: GPXHandler.get_points_for_camm（video_time_scale）
+    種別: pytest ユニットテスト
+    - video_time_scale=1.0でrelative_ms/epoch_timeが従来の挙動と
+      一致するか
+    - video_time_scale!=1.0で、relative_msが動画のネイティブ
+      （圧縮された）タイムライン上の位置に、epoch_timeが実際の
+      撮影時刻になっているか
+
+  Step 13-4: Exporter（video_time_scale反映・新コマンドテンプレート）
+    種別: pytest ユニットテスト（モック中心）
+    - get_video_start_time_str()がvideo_time_scaleを反映するか
+    - export()が生成するcamm_pointsのrelative_msが動画の実尺内に
+      収まり、epoch_timeが設定されているか
+    - build_mapillary_tools_command()が
+      `--geotag_source exif --video_sample_distance 3
+      --video_sample_interval -1` を出力するか
+
+  Step 13-5: E2E・タイムラプスのMapillary連携（実機検証）
+    種別: 実際のmapillary_tools・MP4Boxを使った統合テスト
+    - 実世界0.5秒間隔・fps=30相当のタイムラプスを模したCAMM
+      Type6ファイルをGPXHandler.get_points_for_camm()経由で構築し、
+      mapillary_tools video_processに通して
+      ok=True・n_images>0が得られるか（MapillaryOutsideGPXTrackError
+      が発生しないこと、実世界の時間軸で正しく展開されることを
+      実機で確認済み。詳細はimplement.txt 15章）
+    注記: mapillary_tools/MP4Box不在時はスキップできるようにする
+
+  Step 14-1: _prompt_timelapse_settings / load_video統合
+    種別: pytest-qt ウィジェットテスト
+    - has_audio=Falseの場合のみヒントラベルが含まれるか
+    - チェックボックス・間隔入力の最終状態がそのまま戻り値になるか
+      （OKボタンのみ、キャンセル分岐が無いことの確認込み）
+    - load_video()が音声トラック有無に応じて正しいhas_audioを
+      _prompt_timelapse_settings()に渡すか
+    - ダイアログの戻り値が常設のtimelapse_widget
+      （チェックボックス・間隔・state.video_time_scale）に
+      正しく反映されるか
+
+  Step 15-1: CustomTimelineのドラッグスクラブ
+    種別: pytest-qt ウィジェットテスト
+    - ハンドル以外の場所を押した後ドラッグすると、mouseMoveEventの
+      たびにseek_requestedが連続して発火するか（値が単調に変化するか）
+    - mouseReleaseEvent後はドラッグが終了し、それ以上シークが
+      発火しないか
+    - 既存のStart/Endハンドルのドラッグ挙動に回帰が無いか
+
+  Step 15-2: MainWindowの一時停止ボタン
+    種別: pytest-qt ウィジェットテスト
+    - on_pause_clicked()が再生位置を変えずに一時停止するか
+      （playbackStateがPlayingでなくなること、position()が
+      変化しないことの両方を確認）
+
+  Step 16-1: MapMatcher（RDP間引き廃止・fair-useレート制限）
+    種別: pytest ユニットテスト（match_chunk_implとsleep_implを注入し
+         実通信・実待機を避ける）
+    - match_gpx_points()が間引きを行わず、入力と同じ点数を返すか
+      （時刻・標高が1:1で正しく引き継がれるかも含む）
+    - match_route()が複数チャンクの間だけsleep_implを呼び、
+      おおむねMIN_REQUEST_INTERVAL_SEC相当の値になっているか
+    - 1チャンクのみで完結する場合はsleep_implが一切呼ばれないか
+    - 既存のチャンク失敗時のキャンセル/継続ロジックに回帰が無いか
+
+
+4. 開発用依存パッケージ
+----------------------------------------------------------------
+
+  requirements-dev.txt に以下を追加する:
+    pytest
+    pytest-qt
+
+================================================================
+                              以上
+================================================================

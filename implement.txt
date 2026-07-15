@@ -1,0 +1,1622 @@
+================================================================
+  Video-GPX Sync Tool - 実装仕様書
+  版数: 1.6  作成日: 2026-07-12（初版）  更新日: 2026-07-13
+  実装方式: Python 3.11+ / PyQt6
+================================================================
+
+1. 技術スタック
+----------------------------------------------------------------
+
+  言語:          Python 3.11以上
+  GUIフレームワーク: PyQt6 (6.11以降)
+  マップ表示:     PyQt6-WebEngine + Leaflet.js (HTML埋め込み)
+  動画再生:      PyQt6.QtMultimedia (QMediaPlayer + QVideoWidget)
+                 ※ PyQt6本体に同梱。別パッケージのインストールは不要
+  GPX処理:       gpxpy 1.6.2
+  動画トリミング:  ffmpeg (subprocess経由)
+  動画へのGPS埋め込み: GPAC / MP4Box (subprocess経由)
+  マップマッチング: requests（HTTP通信）+ Valhalla trace_attributes API
+                   （外部公開デモサーバー、要インターネット接続。13章）
+
+  依存パッケージ:
+    pip install PyQt6 PyQt6-WebEngine gpxpy requests
+
+  外部ツール（別途インストール）:
+    brew install ffmpeg
+    brew install gpac             ← MP4Boxコマンドを提供、CAMMトラック埋め込みに使用
+    pip install mapillary_tools   ← アップロード時に手動で使用 ＋ 出力後の
+                                     ローカル検証（5-10章・14章）に自動使用。
+                                     ffmpeg/GPACと異なり必須ではない任意ツール
+                                     （未インストールなら検証をスキップするのみ）
+
+  参考バージョン確認日: 2026-07-12（PyPI直接確認）
+    - PyQt6: 6.11.0 (PyPI)
+    - PyQt6-WebEngine: 6.11.0 (PyPI)
+    - gpxpy: 1.6.2 (PyPI, github.com/tkrajina/gpxpy)
+    - mapillary_tools: 0.14.7 (github.com/mapillary/mapillary_tools)
+      ※ mapillary_toolsのバージョンは実際の連携時に再確認すること
+
+  参考ドキュメント確認日: 2026-07-13（公式ドキュメント直接確認）
+    - Valhalla trace_attributes API仕様: valhalla.github.io/valhalla の
+      API Reference（map-matching）を確認。shape/costing/shape_match/
+      trace_options/filters の各パラメータ名、matched_pointsレスポンス
+      （type: matched/interpolated/unmatched）を検証済み（13章）
+    - valhalla1.openstreetmap.de（FOSSGIS e.V.運営の公開デモサーバー）の
+      fair-useポリシー: 1ユーザーあたり1req/秒、全体で100req/秒の
+      レート制限。公開アプリからの利用時は X-Client-Id ヘッダーでの
+      識別が推奨されている（13章で対応）
+
+  注記: implement.txt初版で「PyQt6-Qt6-Multimedia」という別パッケージ
+  名を記載していたが、PyPI上に存在しないパッケージ名であることが
+  判明したため削除した。QtMultimediaはPyQt6本体に含まれる。
+
+
+2. マップ表示の実装方針
+----------------------------------------------------------------
+
+  PyQt6のネイティブマップ機能（QtLocation）はPyQt6では
+  Pythonバインディングが不完全なため、
+  「QWebEngineView + Leaflet.js」の組み合わせを採用する。
+
+  具体的には:
+  1. アプリ起動時にLeaflet.jsを使ったHTMLを生成してQWebEngineViewに読み込む
+  2. GPXルート・現在地マーカーの更新はPython側から
+     QWebEnginePage.runJavaScript() で Leaflet APIを呼び出して行う
+     （HTMLの再ロードは不要 → チラつきなし）
+
+  マーカー更新のJS呼び出し例:
+    self.map_view.page().runJavaScript(
+        f"marker.setLatLng([{lat}, {lon}]);"
+        f"map.panTo([{lat}, {lon}]);"
+    )
+
+  OSMタイルURL:
+    https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
+    Attribution: © OpenStreetMap contributors (表示必須)
+
+  Leaflet.js: CDN (https://unpkg.com/leaflet@1.9.4/) を使用
+  ※ オフラインキャッシュは今回スコープ外
+
+  重要な設定（実機検証で判明）:
+    map_template.html は file:// スキームでローカルから読み込むが、
+    QWebEngineSettingsのデフォルトでは file:// ページはリモートURL
+    （Leaflet CDN）へのアクセスが禁止されており、この設定なしでは
+    Leafletスクリプト自体が読み込めず "L is not defined" エラーに
+    なることを実機で確認した。MapWidget初期化時に以下を必ず設定する:
+      self.settings().setAttribute(
+          QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+          True
+      )
+
+
+3. ディレクトリ構成
+----------------------------------------------------------------
+
+  video_gpx_sync/
+  ├── main.py               # エントリポイント
+  ├── app/
+  │   ├── __init__.py
+  │   ├── state.py          # AppState: アプリケーション状態のデータクラス
+  │   ├── main_window.py    # QMainWindow: 全体レイアウト管理
+  │   ├── map_widget.py     # QWebEngineView ラッパー + Leaflet連携
+  │   ├── video_widget.py   # QMediaPlayer + QVideoWidget + タイムライン
+  │   ├── offset_widget.py  # GPSオフセット調整ボタン群
+  │   ├── timelapse_widget.py  # タイムラプス設定（チェックボックス＋間隔入力、15章）
+  │   ├── time_utils.py     # playback_ms_to_real_ms(): 再生位置→実世界経過時間変換（15章）
+  │   ├── gpx_handler.py    # gpxpy を使ったGPX読み書き・時刻補間
+  │   ├── video_handler.py  # ffmpeg subprocess呼び出し、メタデータ取得
+  │   ├── camm_encoder.py   # GPAC/MP4Box経由でCAMM GPSトラックの埋め込み・読み出し
+  │   ├── exporter.py       # 動画・GPX出力処理
+  │   ├── verification_window.py  # 出力動画のGPS埋め込み検証用の独立ウィンドウ
+  │   ├── map_matcher.py    # Valhalla APIでのマップマッチング、fair-use対応レート制限（13章）
+  │   ├── map_matching_worker.py  # QThreadでmap_matcher処理をバックグラウンド実行
+  │   ├── map_matching_dialog.py  # マップマッチング進捗ダイアログ（プログレスバー＋キャンセル）
+  │   ├── mapillary_validator.py  # mapillary_tools video_processによる出力後ローカル検証（14章）
+  │   ├── mapillary_validation_worker.py  # QThreadでmapillary_validator処理をバックグラウンド実行
+  │   └── mapillary_validation_dialog.py  # ローカル検証中ダイアログ（不定形インジケーター＋キャンセル）
+  ├── assets/
+  │   └── map_template.html # Leaflet.js を使ったマップHTMLテンプレート
+  └── requirements.txt
+
+
+4. 主要クラス設計
+----------------------------------------------------------------
+
+4-1. MainWindow (app/main_window.py)
+  - QMainWindow を継承
+  - 左右のペインを QSplitter で分割
+  - 左: MapWidget + OffsetWidget
+  - 右: VideoWidget
+  - 下部: 再生ボタン群 + 出力ボタン
+  - アプリケーション状態を一元管理するステート:
+      AppState（app/state.py で定義するデータクラス）として保持する
+      video_path: str | None
+      gpx_path: str | None    # 出力ファイル名生成のため元GPXパスも保持
+      gpx_data: gpxpy.GPX | None
+      video_creation_time: datetime | None  # 動画の録画開始時刻（絶対時刻、UTC）
+      offset_seconds: float  # GPS時刻オフセット（秒）
+      video_start_ms: int    # Startマーカー位置（ミリ秒）
+      video_end_ms: int      # Endマーカー位置（ミリ秒）
+      video_duration_ms: int
+      video_time_scale: float  # 再生1msあたりの実世界ms数。通常動画は1.0
+                                # （タイムラプス動画対応。15章）
+  - GPX未読み込み（gpx_data is None）の間は、動画読み込み関連UI
+    （メニュー項目・ドラッグ&ドロップ受付）を無効化する
+      set_video_loading_enabled(bool) のような形でUI状態を制御する
+  - メニューに「ツール」→「検証モードを開く...」を追加する。
+    選択すると VerificationWindow（4-10節）を新規インスタンスとして
+    生成しshow()する。MainWindowのステートには一切影響しない
+  - on_force_sync_clicked()（OffsetWidgetの強制同期ボタンから配線）:
+      動画の作成日時とGPXの記録開始時刻が大きくずれているケース
+      （±ボタンでの手動調整では実質補正不可能な、日付をまたぐ
+      レベルのずれ）に対する安全策。
+      gpx_handler または video_creation_time が無い場合は
+      「先に動画を読み込んでください」の警告を表示して終了する。
+      それ以外の場合:
+        gpx_start_time = gpx_handler.get_all_points()[0].time
+        video_start_true_time = video_creation_time
+                                 + timedelta(milliseconds=
+                                     playback_ms_to_real_ms(
+                                         video_start_ms, state.video_time_scale))
+        offset_sec = (gpx_start_time - video_start_true_time)
+                     .total_seconds()
+        offset_widget.set_offset(offset_sec)
+      これにより、GPXデータ先頭のトラックポイント時刻と、動画
+      タイムラインのStartマーカー位置（動画ファイル自体の0msでは
+      なく、トリミング後に実際に書き出される先頭フレーム）が指す
+      時刻を強制的に一致させる。video_time_scale（15章）が1.0以外
+      （タイムラプス設定有効時）の場合は、再生位置msを実世界経過
+      時間msに変換してから加算する。
+  - load_gpx(path)（マップマッチング統合後のフロー。13章・4-6節・
+    4-11節・4-12節）:
+      1. GPXHandler.load(path) でパース、既存のトラックポイント
+         有無チェック（従来通り）
+      2. MapMatchingWorker（4-12節）に handler.get_all_points() を渡し
+         起動、MapMatchingDialog（4-12節）をモーダル表示する
+      3. ワーカー完了後、結果の points（時刻・標高は元のまま、
+         座標のみスナップ済み）で
+         gpx_handler.replace_points(points)（4-6節）を呼び出す
+      4. 以降は従来通り: state.gpx_path/gpx_data を設定、
+         map_widget.load_gpx_route()、動画読み込みUIの有効化、
+         出力ボタン状態更新
+      ワーカーがキャンセル・エラーになった場合も replace_points()
+      自体は必ず呼ぶ（元座標、または部分的にスナップ済みの座標で
+      継続する。5-9節）
+  - load_video(path)（タイムラプス対応統合後のフロー。15章・4-15節・
+    4-16節）:
+      1. get_creation_time() / get_duration_ms() 取得、
+         state.video_path/video_creation_time/video_duration_ms/
+         video_start_ms/video_end_ms を設定（従来通り）
+      2. state.video_time_scale = 1.0 にリセット
+      3. video_handler.get_fps(path) を取得し self._video_fps に
+         キャッシュする（FFmpegError時は None のまま。タイムラプス
+         設定が有効化された際の倍率計算に使う）
+      4. timelapse_widget.reset()（4-16節）を呼び、タイムラプス設定
+         UIを無効状態に戻す（このreset()が発火するtimelapse_changed
+         シグナル経由でstate.video_time_scale・再生レートも
+         整合させる）
+      5. video_handler.has_audio_stream(path) を判定する
+         （FFmpegError時はTrue扱い＝ヒントを出さない、fail-safe）
+      6. _prompt_timelapse_settings(has_audio) を呼び、
+         「動画の設定確認」ダイアログを表示する（毎回・discoverability
+         対応。下記）。戻り値(enabled, interval_sec)がenabled=Trueの
+         場合、timelapse_widget.checkbox.setChecked(True) →
+         timelapse_widget.interval_spinbox.setValue(interval_sec)を
+         呼び、常設のタイムラプス設定コントロール（4-16節）にも
+         同じ値を反映する（このsetChecked/setValueが発火する
+         timelapse_changedシグナル経由でstate.video_time_scale・
+         再生レートも整合する）
+      7. video_widget.load(path) → _apply_playback_rate()（下記）
+         → _update_export_button_state()
+  - _prompt_timelapse_settings(has_audio: bool) -> tuple[bool, float]
+    （15章。動画読み込み時に毎回表示するタイムラプス設定確認
+    ダイアログ。UI上の常設タイムラプス設定コントロール（4-16節）が
+    動画タイムラインの下という目立たない位置にあり、実際に
+    「見つからない」というフィードバックを受けたことへの対応。
+    2026-07-13の実機診断（headlessでMainWindowを起動しスクリーンショット
+    取得）で常設コントロール自体は正しく描画されていることを確認した
+    うえで、視認性の問題として本ダイアログを追加した）:
+      - has_audio が False の場合のみ、「この動画には音声トラックが
+        検出されませんでした。タイムラプス動画の可能性があります
+        （自動判定ではないため確証はありません）。」というQLabelの
+        ヒントをダイアログ先頭に追加する（旧版ではQMessageBox.information
+        で別立てに表示していたが、アクション（チェックボックス）と
+        切り離されていて見落とされやすかったため、本ダイアログに統合した）
+      - QCheckBox「タイムラプス動画」（既定OFF）＋ QDoubleSpinBox
+        「間隔(秒):」（既定0.5、チェック時のみ有効化。TimelapseWidgetの
+        DEFAULT_INTERVAL_SEC・レンジ設定を再利用）
+      - QDialogButtonBoxはOKボタンのみ（Cancelは設けない。既定値
+        （タイムラプス無効）のまま進めても実害が無いため、確認せず
+        閉じられる操作は用意しない設計とした）
+      - dialog.exec() 完了後、チェックボックス・スピンボックスの
+        最終状態をそのままタプルで返す（Acceptedかどうかによる分岐は
+        行わない）
+  - on_timelapse_changed(enabled, interval_sec)（TimelapseWidget.
+    timelapse_changedから配線。15章）:
+      enabled かつ self._video_fps が None でない場合:
+        state.video_time_scale = interval_sec * self._video_fps
+      それ以外: state.video_time_scale = 1.0
+      続けて _apply_playback_rate()、
+      on_position_changed(video_widget.timeline.position_ms())
+      （プレビュー即時反映）、_update_export_button_state() を呼ぶ
+  - _apply_playback_rate()（15章）:
+      state.video_time_scale != 1.0 の場合:
+        video_widget.player.setPlaybackRate(1.0 / state.video_time_scale)
+        video_widget.audio_output.setMuted(True)
+      それ以外:
+        video_widget.player.setPlaybackRate(1.0)
+        video_widget.audio_output.setMuted(False)
+      タイムラプス動画を見かけ上「間隔秒あたり1フレーム」で再生する
+      ための処理。実機検証（Qt 6.11、FFmpegベースのマルチメディア
+      バックエンド、macOS）で setPlaybackRate() に0.067倍速のような
+      極端に遅い値を設定してもエラーなく動作し、position()が経過
+      時間にほぼ比例して進行することを確認済み。
+  - 出力ボタンのラベルは「📤 Export & Test」とする（5-6節・8章の
+    レイアウト詳細も参照）
+  - on_pause_clicked()（旧on_stop_clicked。5-5節。2026-07-13変更）:
+      video_widget.pause() のみ呼ぶ。Startマーカー位置へのシークは
+      行わない（旧仕様では停止＝一時停止＋Startへのシークだったが、
+      「シークバーがドラッグできないため、途中で止めても先頭に
+      戻ってしまうのは致命的」というフィードバックを受け、
+      一時停止に徹する仕様に変更した。先頭に戻りたい場合は
+      4-4節のシークバードラッグで代替する）
+  - on_export_clicked()（5-10節・14章。出力後ローカル検証の統合）:
+      1. 出力先ディレクトリ選択ダイアログ（従来通り）
+      2. exporter.export(state, output_dir) を呼び出し、動画・GPX
+         パスを得る（従来通り。4-9節）
+      3. build_mapillary_tools_command() でコマンド文字列を組み立てる
+         （従来通り）
+      4. mapillary_validator.is_mapillary_tools_available() が
+         True の場合のみ:
+           MapillaryValidationWorker（14章）に video_path と
+           video_start_time文字列を渡して起動、
+           MapillaryValidationDialog（14章）をモーダル表示し、
+           完了まで待つ（load_gpx()のマップマッチング統合と同じ
+           パターン。4-12節）
+         False の場合: 検証をスキップし、その旨を完了メッセージ
+         に含める
+      5. 完了ダイアログ（QMessageBox）に、動画・GPXパス、
+         mapillary_toolsコマンド例に加えて、4.の検証結果
+         （件数・エラー・警告、またはスキップ理由）を追記して表示
+
+4-2. MapWidget (app/map_widget.py)
+  - QWebEngineView を継承
+  - メソッド:
+      load_gpx_route(points: list[tuple[float,float]])
+        → Leaflet polyline を JS で描画
+      update_marker(lat: float, lon: float)
+        → runJavaScript で marker.setLatLng() + panTo()
+      hide_marker()
+        → runJavaScript で marker を非表示化
+           （interpolate_position が None を返した場合に呼び出す）
+      clear()
+        → ルートとマーカーを消去
+
+  注: QWebEngineView と QVideoWidget（4-3節）を同一ウィンドウ内で
+  併用するため、main.py で QApplication インスタンス生成前に
+  QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+  を呼び出しておく必要がある（OpenGLコンテキスト共有の事前設定）。
+
+4-3. VideoWidget (app/video_widget.py)
+  - QWidget を継承
+  - 構成要素:
+      QVideoWidget       # 動画描画エリア
+      QMediaPlayer       # 再生制御
+      QAudioOutput       # 音声出力（ミュートでも必要）
+      CustomTimeline     # カスタムタイムラインウィジェット（後述）
+  - シグナル:
+      position_changed(ms: int)  # 再生位置が変わるたびに発火
+
+  - QMediaPlayer の使い方（PyQt6 最新版）:
+      self.player = QMediaPlayer()
+      self.audio  = QAudioOutput()
+      self.player.setAudioOutput(self.audio)
+      self.player.setVideoOutput(self.video_widget)
+      self.player.setSource(QUrl.fromLocalFile(path))
+      self.player.positionChanged.connect(self.on_position_changed)
+
+  注（テスト時に判明した既知の問題）: QMediaPlayerにソースを
+  setSource()した状態のままウィジェットを破棄すると、
+  AVFoundationバックエンド（macOS）の後片付けがQtイベントループ外で
+  ブロックし、プロセスがハングすることを実機検証（pytest-qt環境）で
+  確認した。アプリ終了時や動画の差し替え時には、
+  player.stop() → player.setSource(QUrl()) の順で明示的に
+  解放してから次の処理に進むこと。通常のGUI操作（app.exec()の
+  イベントループが常時回っている状態）では発生しにくいと見られるが、
+  念のためMainWindowの終了処理（closeEvent等）でも同様の後片付けを
+  行うことが望ましい。
+
+4-4. CustomTimeline (app/video_widget.py 内)
+  - QWidget を継承し、paintEvent で自前描画
+  - 要素:
+      - 全体バー（動画全長）
+      - Start/End マーカー（ドラッグ可能な三角形ハンドル）
+      - 現在位置インジケーター（赤い縦線）
+      - 時刻ラベル（現在時刻、Start時刻、End時刻）
+  - ドラッグ検出: mousePressEvent / mouseMoveEvent / mouseReleaseEvent
+    - self._dragging は "start" / "end" / "position" / None の
+      いずれか
+    - Start/Endハンドルのヒット判定（HANDLE_HIT_RADIUS_PX以内）に
+      該当しない場所を押した場合は "position" として扱い、
+      押した瞬間に一度 seek_requested を発火した上で、そのまま
+      ドラッグを継続すると mouseMoveEvent のたびに連続して
+      seek_requested を発火する（スクラブ操作。2026-07-13追加。
+      以前は押した瞬間の1回しかシークされず、ドラッグに追従
+      しなかった。ユーザーから「シークバーがドラッグできないのは
+      致命的」というフィードバックを受けて対応した）
+  - Start/End の制約:
+      Start < End
+      現在位置 < End に達したら停止 or Start に戻る
+
+4-5. OffsetWidget (app/offset_widget.py)
+  - QWidget を継承
+  - ±1秒、±10秒、±1分、±10分 の QPushButton 8個
+  - 現在オフセット表示ラベル（例: +00:12 / -01:30）
+  - リセットボタンと、その隣に同サイズの強制同期ボタン
+    （force_sync_button、QHBoxLayoutで横並び。ラベルは「強制同期」）
+    ※ 強制同期ボタン自体はクリックシグナルを外部に公開するのみで、
+    オフセット計算ロジックは持たない（GPX/動画の状態を保持しない
+    ためMainWindow側で計算する。4-1節参照）
+  - シグナル:
+      offset_changed(seconds: float)
+  - メソッド:
+      set_offset(seconds: float)
+        現在値に関わらずoffsetを直接上書きし、ラベル更新＋
+        offset_changed発火する（既存の各ステップボタンによる
+        _adjust()が「加算」なのに対し、こちらは「上書き」）。
+        MainWindowのon_force_sync_clicked()から呼ばれる。
+
+4-6. GPXHandler (app/gpx_handler.py)
+  - load(path: str) -> gpxpy.GPX
+  - get_all_points() -> list[GPXTrackPoint]
+      GPX内の全トラック・全セグメントのポイントを時刻順にソートし、
+      1本の連続した点列として返す（複数トラック/セグメントも結合する）
+  - interpolate_position(video_time_ms: int,
+                         offset_sec: float,
+                         video_creation_time: datetime,
+                         video_time_scale: float = 1.0
+                        ) -> tuple[float, float] | None
+    ロジック:
+      gpx_time = video_creation_time
+                 + timedelta(milliseconds=
+                     playback_ms_to_real_ms(video_time_ms, video_time_scale))
+                 + timedelta(seconds=offset_sec)
+      gpxの前後のポイントから線形補間で緯度経度を返す
+      対応する時刻範囲が記録範囲外の場合は None を返す
+
+      注記: 旧版では引数に video_start_ms を含めていたが、
+      6節の数式で video_start_ms が代数的に相殺されることが
+      判明したため削除し、代わりに必須である video_creation_time
+      を引数に追加した（旧シグネチャには video_creation_time が
+      無く、絶対時刻への変換が実装不可能だった）。
+
+      video_time_scale はタイムラプス動画対応（15章）の追加引数。
+      playback_ms_to_real_ms()（app/time_utils.py）は
+      round(video_time_ms * video_time_scale) を返すだけの単純な
+      関数。デフォルト1.0（通常動画）では従来と全く同じ結果になる。
+      export_trimmed() / get_points_for_camm() /
+      _build_output_points() / _raw_time_range() / has_overlap() にも
+      同じ video_time_scale 引数（デフォルト1.0）を追加し、
+      内部で playback_ms_to_real_ms() を使って一貫して実世界時刻に
+      変換する（フェーズ2で対応。15章）。
+  - export_trimmed(output_path: str,
+                   video_start_ms: int,
+                   video_end_ms: int,
+                   offset_sec: float,
+                   video_creation_time: datetime,
+                   video_time_scale: float = 1.0)
+    ロジック:
+      _build_output_points()（下記）で得た点列を、真の絶対時刻
+      （true_time）付きのGPXTrackPointに変換し、
+      オフセット適用済みの時刻でGPX 1.1 として書き出す
+      gpx.to_xml() で出力
+
+  - get_points_for_camm(video_start_ms: int,
+                        video_end_ms: int,
+                        offset_sec: float,
+                        video_creation_time: datetime,
+                        video_time_scale: float = 1.0
+                       ) -> list[tuple[int, float, float, float, float]]
+    CAMMトラック埋め込み（camm_encoder.py・15章）用に、
+    _build_output_points() で得た点列を(relative_ms, latitude,
+    longitude, elevation, epoch_time)のタプル列に変換して返す。
+    elevationがNoneの場合は0.0を使う。
+      true_start_time = video_creation_time
+                         + timedelta(milliseconds=
+                             playback_ms_to_real_ms(video_start_ms, video_time_scale))
+      real_ms_delta = round((true_time - true_start_time).total_seconds() * 1000)
+      relative_ms = real_ms_to_playback_ms(real_ms_delta, video_time_scale)
+        # = round(real_ms_delta / video_time_scale)
+        # 動画自身の圧縮されたネイティブな再生タイムライン上の位置
+        # （CAMMサンプルをどのフレームに対応させるかの空間的配置）
+      epoch_time = true_time.timestamp()
+        # 実際の撮影時刻(Unixエポック秒)。mapillary_tools側が
+        # time_gps_epochとして直接採用するため、relative_msが
+        # 圧縮されていても正しい実時刻が得られる（15章）
+    video_time_scale=1.0（通常動画）では relative_ms = real_ms_delta
+    となり、動作は変更前と完全に同じになる。
+    ロジックの大部分（対象範囲抽出・境界補間）は export_trimmed() と
+    共通のため、_build_output_points() という内部メソッドに集約し、
+    export_trimmed() と get_points_for_camm() の両方から呼び出す。
+
+  - _build_output_points(video_start_ms, video_end_ms, offset_sec,
+                         video_creation_time, video_time_scale=1.0)
+      -> list[tuple[datetime, float, float, float | None]]
+    （true_time, latitude, longitude, elevation）のリストを返す
+    内部共通ヘルパー。true_time は常に実世界の絶対時刻
+    （video_time_scale適用済み）であり、動画自身の圧縮タイムライン上の
+    位置ではない点に注意（コンテナ内配置への変換はget_points_for_camm
+    側でreal_ms_to_playback_ms()を使って行う）。境界補間ロジック
+    （4-6節の既存export_trimmedロジック）をここに集約する。
+
+  - replace_points(points: list[gpxpy.gpx.GPXTrackPoint]) -> None
+    マップマッチング（13章・4-11節）完了後、self.gpx を単一トラック・
+    単一セグメントの構造に作り直し、渡されたpointsで完全に置き換える。
+    既存の複数トラック/セグメント構造は破棄されるが、get_all_points()
+    はもともと全トラック・セグメントを時刻順に結合した1本の点列として
+    扱う設計であり（4-6節冒頭）、他の全メソッド（interpolate_position/
+    has_overlap/export_trimmed/get_points_for_camm）はget_all_points()
+    経由でしか点列を参照しないため、置き換え後も既存ロジックへの影響は
+    ない。MainWindow.load_gpx()（4-1節）からのみ呼ばれる想定。
+
+4-7. VideoHandler (app/video_handler.py)
+  - get_metadata(path: str) -> dict
+    ffprobe で動画長・作成日時を取得:
+      subprocess.run([
+          "ffprobe", "-v", "quiet",
+          "-print_format", "json",
+          "-show_format", "-show_streams",
+          path
+      ], capture_output=True)
+  - get_keyframe_timestamps(path: str) -> list[float]
+    ffprobe でキーフレーム位置（秒）の一覧を取得:
+      subprocess.run([
+          "ffprobe", "-v", "quiet",
+          "-select_streams", "v:0",
+          "-skip_frame", "nokey",
+          "-show_entries", "frame=pts_time",
+          "-of", "csv=print_section=0",
+          path
+      ], capture_output=True)
+    注: 実機検証で、出力の1行目のみ末尾にカンマが付く場合がある
+    （例: "0.000000,"）ため、パース時は各行を","で分割し
+    先頭要素のみ使う実装にする。
+  - get_fps(path: str) -> float
+    ffprobeのr_frame_rate（例: "30000/1001"）から算出:
+      subprocess.run([
+          "ffprobe", "-v", "quiet",
+          "-select_streams", "v:0",
+          "-show_entries", "stream=r_frame_rate",
+          "-of", "csv=p=0",
+          path
+      ], capture_output=True)
+      → "num/den" 形式の文字列をfloatに変換する
+  - has_audio_stream(path: str) -> bool（15章。タイムラプスの
+    可能性を示す弱いヒント判定に使用）
+      subprocess.run([
+          "ffprobe", "-v", "quiet",
+          "-select_streams", "a",
+          "-show_entries", "stream=index",
+          "-of", "csv=p=0",
+          path
+      ], capture_output=True)
+      → 標準出力が空でなければ音声ストリームありと判定する
+  - export_trimmed(input_path: str,
+                   output_path: str,
+                   start_ms: int,
+                   end_ms: int,
+                   video_creation_time: datetime | None = None)
+    Smart Cut方式（境界GOPのみ再エンコード＋中間はストリームコピー）:
+      1. get_keyframe_timestamps() でキーフレーム位置を取得
+      2. start_ms以降で最初のキーフレーム時刻 kf_start を求める
+         （start_msがちょうどキーフレームに一致する場合は区間Aは不要）
+      3. end_ms以前で最後のキーフレーム時刻 kf_end を求める
+         （end_msがちょうどキーフレームに一致する場合は区間Cは不要）
+      4. kf_start >= kf_end の場合（Start/Endが同一GOP内に収まる場合）:
+         区間分割はせず、start_ms〜end_msを単一の再エンコードで
+         書き出して終了する（区間B自体が存在しないため）
+      5. 区間A（再エンコード）: start_ms 〜 kf_start
+           subprocess.run([
+               "ffmpeg", "-ss", str(start_ms/1000), "-to", str(kf_start),
+               "-i", input_path,
+               "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+               "-c:a", "aac",
+               tmp_part_a
+           ])
+      6. 区間B（ストリームコピー）: kf_start 〜 kf_end
+         注意: "-to" によるストリームコピーの終端指定は、
+         B-フレームの並び替え（DTS/PTSのずれ）により、意図した
+         キーフレーム境界を2〜4フレーム超過する場合があることを
+         実機検証で確認した（ffmpeg 8.1.2で実測: 期待144フレームに
+         対し146フレーム混入）。これを避けるため、"-to" ではなく
+         正確なフレーム数指定（-frames:v）を用いる:
+           fps = get_fps(input_path)  # 例: r_frame_rate から算出
+           frame_count = round((kf_end - kf_start) * fps)
+           subprocess.run([
+               "ffmpeg", "-ss", str(kf_start),
+               "-i", input_path,
+               "-frames:v", str(frame_count),
+               "-c", "copy",
+               tmp_part_b
+           ])
+      7. 区間C（再エンコード）: kf_end 〜 end_ms
+           subprocess.run([
+               "ffmpeg", "-ss", str(kf_end), "-to", str(end_ms/1000),
+               "-i", input_path,
+               "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+               "-c:a", "aac",
+               tmp_part_c
+           ])
+      8. concat demuxer で区間A+B+Cを結合:
+           concat_list.txt に各ファイルパスを記載し
+           subprocess.run([
+               "ffmpeg", "-f", "concat", "-safe", "0",
+               "-i", concat_list_path,
+               "-c", "copy",
+               output_path
+           ])
+      9. 一時ファイル（tmp_part_a/b/c, concat_list.txt）を削除
+
+      注: 区間A・区間Cの再エンコード設定（コーデック・crf等）は
+      入力動画のコーデックに応じて調整する。存在しない区間
+      （境界がキーフレームに一致する場合）はスキップして
+      concatの対象から除外する。
+
+      音声について: 各区間の再エンコード境界でAACエンコーダの
+      priming/padding sampleにより、コンテナ全体の再生時間が
+      数十ミリ秒（実測23ms程度）ずれる場合があるが、映像フレーム数は
+      正確に一致するため実用上問題ない。
+
+      重要（Step 8のmapillary_tools連携検証で判明した問題と対処）:
+      Smart Cutで生成したconcat出力には、元動画が持っていた
+      creation_timeメタデータが一切引き継がれないことを実機で確認した
+      （ffprobeで空になる）。対処として、video_creation_time が
+      渡された場合は
+      new_creation_time = video_creation_time + timedelta(milliseconds=start_ms)
+      を計算し、最終出力（concatステップ、または単一GOP内で完結する
+      再エンコードのケース）に
+        "-metadata", f"creation_time={new_creation_time.isoformat()}"
+      を付与するようにした。
+      ただし4-8節（CammEncoder）で後述する通り、この直後にMP4Boxで
+      CAMMトラックを追加する際、MP4Box自身がcreation_timeを
+      「処理を実行した現在時刻」で上書きしてしまうことを実機で確認した。
+      そのため、最終出力ファイルのcreation_timeメタデータは正確な値に
+      ならない前提とし、mapillary_toolsへは10節の
+      --video_start_time オプション（コマンド実行時にミリ秒精度で
+      明示指定）で正しい時刻を渡す設計とする。ここでのffmpeg側の
+      creation_time設定は「他ツールで開いた際のベストエフォートな
+      参考値」の位置づけとする。
+
+4-8. CammEncoder (app/camm_encoder.py)
+  Smart Cutで生成した動画に、GPXから計算したGPS位置情報を
+  Google CAMM（Camera Motion Metadata）形式の埋め込みメタデータ
+  トラックとして追加する。GPAC付属の MP4Box を subprocess 経由で
+  呼び出して実現する。
+
+  背景・実機検証で判明したこと:
+  - CAMMはGoogleの公開仕様（developers.google.com/streetview/publish/camm-spec）。
+    当初はGPSサンプル（Type 5, MIN_GPS）: reserved(uint16) +
+    type(uint16)=5 + latitude(double) + longitude(double) +
+    altitude(double) の28バイトを使っていたが、15章のタイムラプス
+    対応（フェーズ2）で **Type 6（GPS）** に変更した。Type 6は
+    time_gps_epoch（UTCエポック秒での実際の撮影時刻）を含む、より
+    情報量の多いフォーマットで、mapillary_tools側がこれを検出できれば
+    動画自体のfps・PTSと無関係に正しい実撮影時刻を採用してくれる
+    （15章で詳述）。
+  - ffmpeg自体には任意の4CC（'camm'）でトラックを書き込む機能がないが、
+    GPACのMP4Boxには「NHML」という汎用の生サンプルインポート形式があり、
+    mediaSubType="camm" を指定することで、未知コーデック用の
+    汎用サンプルエントリとして書き込めることを実機で確認した。
+  - mapillary_tools（0.14.7）は --geotag_source exif（10章参照。
+    camm ではない点に注意）で、このType 6 CAMMトラックから
+    サンプリング段階（sample_video）が書き込んだ画像EXIFの位置・
+    time_gps_epoch由来の実時刻を正しく読み取り、ジオタグできることを
+    実機で確認済み（座標・実時刻が期待値と完全一致。15章）。
+  - 制約1（解消済み）: 旧Type 5実装では
+    --video_sample_distance（距離ベースサンプリング）でのGPS自動検出が
+    「No GPS data found from the video」で失敗し、時間ベース
+    （--video_sample_distance -1 --video_sample_interval N）を
+    使わざるを得なかった。Type 6への切り替え後、距離ベースサンプリングが
+    正常に動作することを実機で確認した（15章）。時間ベースサンプリングは
+    CAMMのtime_gps_epochを一切参照しない別のコードパスであることが
+    判明したため、現在は距離ベースサンプリングを採用している（10章）。
+  - 制約2: ffmpegは未知コーデックのトラックをストリームコピーで
+    パススルーできない（"Could not find tag for codec none in
+    stream" エラーで失敗することを実機確認）。そのため
+    CAMMトラック埋め込み（MP4Box）は、ffmpegによる処理
+    （Smart Cut、creation_time設定）が全て完了した後の
+    **最後の工程**として実行し、それ以降はffmpegで触らないこと。
+  - 制約3: MP4Boxでトラックを追加すると、動画のcreation_time
+    メタデータが「処理を実行した現在時刻」で上書きされることを
+    実機確認した。この対策として、mapillary_toolsには
+    --video_start_time をコマンド引数として明示指定する
+    （ファイル内のcreation_timeに依存しない）。実機検証で
+    --video_start_time を指定すれば、creation_timeが不正な値でも
+    正しくジオタグできることを確認済み。
+
+  - CAMM_GPS_TYPE6_STRUCT = struct.Struct("<HHdiddfffffff")
+    （リトルエンディアン。フィールド順:
+     reserved(uint16), type(uint16)=6, time_gps_epoch(double),
+     gps_fix_type(int32), latitude(double), longitude(double),
+     altitude(float), horizontal_accuracy(float),
+     vertical_accuracy(float), velocity_east/north/up(float×3),
+     speed_accuracy(float)。合計60バイト）
+    mapillary_tools側の camm/camm_parser.py の GPSSampleEntry.construct
+    と完全に一致するフィールド順・型で実装した（実機検証で
+    time_gps_epochが正しく読み取れることを確認済み）。
+    速度系フィールド(velocity_*)は本ツールでは計算せず0.0固定、
+    精度系フィールド(horizontal_accuracy/vertical_accuracy/
+    speed_accuracy)は実機検証で問題が出なかった無難な値
+    （5.0/5.0/1.0）を固定で使う。gps_fix_typeは3（3D fix）固定。
+
+  - embed_gps_track(video_path: str,
+                    output_path: str,
+                    points: list[tuple[int, float, float, float, float]])
+    points は (relative_ms, latitude, longitude, elevation, epoch_time)
+    のリスト（GPXHandler.get_points_for_camm() の戻り値をそのまま渡す）。
+    relative_ms は動画自身の圧縮されたネイティブな再生タイムライン上の
+    位置（CAMMサンプルをどのフレームに対応させるかの空間的な配置）、
+    epoch_time はそのGPS点の実際の撮影時刻（Unixエポック秒、15章）。
+    ロジック:
+      1. pointsをCAMM Type 6バイナリ（各60バイト、リトルエンディアン）
+         にエンコードし、一時的な .raw ファイルに書き出す
+           CAMM_GPS_TYPE6_STRUCT.pack(
+               0, 6, epoch_time, 3, lat, lon, elevation or 0.0,
+               5.0, 5.0, 0.0, 0.0, 0.0, 1.0)
+      2. NHMLマニフェスト（.nhml、XML）を生成:
+           <NHNTStream mediaType="meta" mediaSubType="camm"
+                       codecID="camm" timeScale="1000"
+                       baseMediaFile="<rawファイル名>">
+             <NHNTSample DTS="<relative_ms>" dataLength="60"
+                         mediaOffset="<累積バイトオフセット>"/>
+             ...
+           </NHNTStream>
+      3. MP4Boxを実行して既存動画にトラックを追加:
+           subprocess.run([
+               "MP4Box", "-add", video_path,
+               "-add", nhml_path,
+               output_path
+           ])
+      4. 一時ファイル（.raw, .nhml）を削除
+
+  - extract_gps_track(video_path: str) -> list[tuple[int, float, float, float]]
+    embed_gps_track() の逆操作。検証モード（4-10節 VerificationWindow）で
+    使用する。VerificationWindowはプレビュー用の位置表示にしか使わない
+    （time_gps_epoch等の付加情報は不要）ため、戻り値は
+    embed_gps_track()以前と同じ(relative_ms, latitude, longitude,
+    elevation)の4要素タプルのリストとし、Type 6の追加フィールド
+    （time_gps_epoch・gps_fix_type・各種accuracy・velocity）は
+    読み捨てる。
+    実機検証で embed → extract の往復が(relative_ms, lat, lon,
+    elevation)の4フィールドについて完全に一致することを確認済み。
+    ロジック:
+      1. subprocess.run(["MP4Box", "-info", video_path]) の出力を
+         パースし、"Media Type: meta:camm" を含むトラックのIDを特定
+         （見つからない場合は CammTrackNotFoundError を送出）
+      2. 一時ディレクトリで以下を実行し、.nhml と .media
+         （生バイナリ）のペアを書き出す:
+           subprocess.run(["MP4Box", "-nhml", str(track_id), video_path])
+      3. .nhml（XML）をパースし、各 NHNTSample の DTS(relative_ms)・
+         dataLength・累積バイトオフセットを取得
+      4. .media ファイルから該当バイト列を読み、
+         CAMM_GPS_TYPE6_STRUCT.unpack(chunk) でデコードして
+         (relative_ms, latitude, longitude, elevation) を得る
+         （time_gps_epoch等の残りのフィールドは破棄）
+      5. 一時ファイル（.nhml, .media）を削除
+
+  - interpolate_camm_points(points: list[tuple[int, float, float, float]],
+                            video_time_ms: int
+                           ) -> tuple[float, float] | None
+    検証モード用の補間関数。GPXHandler._interpolate_at() と同様の
+    二分探索＋線形補間ロジックだが、絶対時刻ではなく
+    relative_ms（動画内の相対ミリ秒）を直接キーにする点がシンプルな
+    差分（video_creation_timeやoffsetの計算が一切不要）。
+    points は relative_ms でソート済みの前提。範囲外は None を返す。
+
+4-9. Exporter (app/exporter.py)
+  - export(state: AppState, output_dir: str)
+    1. GPXとオフセット適用後の時刻範囲が動画Start〜Endと重複するか
+       事前チェック（重複しない場合はこの関数を呼び出せない
+       ＝出力ボタンが無効化されている想定）
+    2. 出力ファイル名を生成:
+         video_name = f"{元動画ファイル名（拡張子除く）}_synced.mp4"
+         gpx_name   = f"{元GPXファイル名（拡張子除く）}_synced.gpx"
+    3. 出力先に同名ファイルが存在する場合は連番を付与:
+         例: "ride01_synced.mp4" が存在すれば
+             "ride01_synced_2.mp4" のように連番を増やして
+             重複しなくなるまで繰り返す
+    4. VideoHandler.export_trimmed() を呼び出し、一時パスに
+       Smart Cut済み動画（creation_time設定込み）を書き出す
+    5. GPXHandler.get_points_for_camm() でCAMM用の点列を取得し、
+       CammEncoder.embed_gps_track() を呼び出して、4.の一時動画に
+       CAMMトラックを追加した最終版を video_name の場所に書き出す
+       （4.の一時ファイルは削除する）
+    6. GPXHandler.export_trimmed() を呼び出し、バックアップ用の
+       GPXファイルを書き出す
+    ※ 完了ダイアログの表示・mapillary_toolsコマンド例の生成・14章の
+    ローカル検証の起動は Exporter.export() の責務ではなく、
+    MainWindow.on_export_clicked()（4-1節）が export() 完了後に
+    呼び出す形で行う（Exporterはファイル生成のみに責務を絞る）
+
+  - can_export(state: AppState) -> bool
+      GPXとオフセット適用後の時刻範囲が動画Start〜Endと
+      重複するかどうかを判定し、出力ボタンの有効/無効に反映する。
+      内部で GPXHandler.has_overlap() に state.video_time_scale を
+      渡すため、タイムラプス設定（15章）が有効な場合も正しい実時刻
+      範囲で判定される。
+
+  - get_video_start_time_str(state: AppState) -> str
+      トリミング後の動画の実際の録画開始時刻を、mapillary_toolsの
+      --video_start_time 形式（YYYY_MM_DD_HH_MM_SS_sss、UTC）で返す。
+      build_mapillary_tools_command() と MapillaryValidator（4-13節）
+      の両方から使う共通値。
+        synced_start_time = state.video_creation_time
+                             + timedelta(milliseconds=
+                                 playback_ms_to_real_ms(
+                                     state.video_start_ms, state.video_time_scale))
+      video_time_scale=1.0（通常動画）では従来と同じ計算になる。
+
+4-10. VerificationWindow (app/verification_window.py)
+  Mapillaryへのアップロード前に、出力済みMP4のGPS埋め込みが
+  正しいかを目視確認するための独立ウィンドウ。MainWindowの
+  ステート（GPX読み込み状況、Start/End、オフセット等）には
+  一切依存しない。
+
+  - QMainWindow を継承（MainWindowとは別インスタンス）
+  - MainWindowのメニュー（「ツール」→「検証モードを開く...」）から
+    起動する
+  - 構成: MapWidget（左） + VideoWidget（右）+ 再生/停止ボタン
+    （MainWindowのレイアウトを簡略化したもの。OffsetWidgetや
+    出力ボタンは無い）
+  - camm_points: list[tuple[int, float, float, float]] を保持する
+    インスタンス変数
+
+  - open_video(path: str):
+      1. CammEncoder.extract_gps_track(path) を呼び出す
+      2. CammTrackNotFoundError の場合は「この動画にはGPSトラックが
+         埋め込まれていません」とエラーダイアログを表示して中断
+      3. self.camm_points に結果を保存
+      4. map_widget.load_gpx_route(
+           [(lat, lon) for _, lat, lon, _ in self.camm_points]
+         ) でルートを描画
+      5. video_widget.load(path) で動画を読み込む
+
+  - video_widget.position_changed シグナルに接続:
+      def on_position_changed(self, ms: int):
+          pos = interpolate_camm_points(self.camm_points, ms)
+          if pos is not None:
+              self.map_widget.update_marker(*pos)
+          else:
+              self.map_widget.hide_marker()
+
+  - closeEvent: MainWindowの4-3節と同様、
+    video_widget.player.stop() → setSource(QUrl()) の順で
+    後片付けしてから閉じる
+
+4-11. MapMatcher (app/map_matcher.py)
+  GPX読み込み時（5-9節）に、記録軌跡を道路網へスナップする。
+  設計・アルゴリズムは姉妹プロジェクト ../gpx-editor（React/JS版、
+  src/lib/mapMatching.js）に倣い、Pythonへ移植する。
+  gpx-editorとの違いは、gpx-vsyncでは各点の記録時刻・標高を
+  スナップ後も保持する必要がある点（時刻同期の根幹機能のため）。
+  外部API仕様の詳細は13章を参照。
+
+  Douglas-Peucker間引き廃止について（2026-07-14、フェーズ変更）:
+    当初はgpx-editorのrdp.jsに倣い、送信前にDouglas-Peucker法
+    （RDP_EPSILON=0.00005度≒5.5m）で軌跡点を間引いていた。しかし
+    実際のユーザーデータ（1Hzロガーで記録された382点のGPX）で
+    検証したところ、間引き後は26点まで減少（93%削減）しており、
+    トラックポイントの記録間隔がそもそも0.5〜1秒程度と細かい
+    ケースでは、動画フレームとの時刻補間の分解能を不必要に
+    大きく犠牲にしていることが判明した。ユーザーからのフィードバック
+    （「間引きすぎ」「trkpt間隔が0.5秒より長いなら間引き無しに
+    してほしい」）を受け、間引きを完全に廃止し、全トラックポイントを
+    そのままマップマッチングAPIに送信する方式に変更した
+    （rdp_mask/rdp_simplify/RDP_EPSILONは削除済み）。
+
+  座標のみを扱う純粋ロジック（gpx-editorのmapMatching.jsに対応、
+  gpxpy非依存でユニットテストしやすい層）:
+
+  - CHUNK_SIZE = 50（gpx-editorと同一値）
+  - MIN_REQUEST_INTERVAL_SEC = 1.0（fair-use対応。下記match_route参照）
+
+  - match_chunk(chunk: list[tuple[float, float]],
+               search_radius: float = 50, timeout: float = 30
+              ) -> dict
+    Valhalla trace_attributes（13章）へのPOSTリクエストを1回行い、
+    レスポンスJSONをそのまま返す。costing=bicycle固定、
+    shape_match=map_snap固定。requestsライブラリのtimeout引数で
+    タイムアウトを指定する（AbortController相当）。
+    X-Client-Id: gpx-vsync ヘッダーを付与する（13章）。
+    HTTPエラー・タイムアウト時は例外を送出する（呼び出し側の
+    match_route()がチャンク単位で継続/中断を判断する。
+    gpx-editorのmatchChunk()と同じ責務分担）。
+
+  - apply_matched_points(original_chunk, match_response) -> list[tuple[float, float]]
+    match_responseの matched_points 配列を見て、type が
+    "matched" または "interpolated" の点だけ座標を置き換える。
+    それ以外（unmatched等）は元座標を保持する。
+    gpx-editorのapplyMatchedPoints()と同一ロジック。
+
+  - @dataclass MatchResult:
+      matched_points: list[tuple[float, float]]
+      n_snapped: int
+      status: str  # "完了" | "エラー" | "キャンセル"
+      error: str | None
+
+  - match_route(points: list[tuple[float, float]],
+               on_progress: Callable[[MatchProgress], None] | None = None,
+               should_cancel: Callable[[], bool] | None = None,
+               match_chunk_impl: Callable = match_chunk,
+               sleep_impl: Callable[[float], None] = time.sleep
+              ) -> MatchResult
+    points を50点ずつのチャンクに分割し、チャンクごとに
+    match_chunk_impl() を順次呼び出す（gpx-editorのmatchRoute()と
+    同一ロジック）。
+      - 各チャンク処理前に should_cancel() を確認し、Trueなら
+        その時点までの結果で status="キャンセル" として返す
+      - fair-use対応（2026-07-14追加）: 2チャンク目以降は、送信前に
+        直前チャンクの送信開始時刻からMIN_REQUEST_INTERVAL_SEC
+        （1.0秒）経過しているか確認し、経過していなければ不足分だけ
+        sleep_impl()で待機してから送信する。match_chunk_impl自体の
+        応答時間（ネットワーク遅延込み）は待機時間から差し引かれる
+        ため、レスポンスが遅い場合に余分な待機は発生しない。
+        1チャンクのみで完結する場合は待機自体が発生しない。
+        sleep_impl はテスト時に高速なダミー（例:
+        `lambda _seconds: None`）へ差し替えられるようDI可能にした
+        （実運用では既定のtime.sleepを使う）
+      - チャンク0（1チャンク目）で例外発生: 全体を自動キャンセル扱いにし、
+        元のpointsをそのまま status="キャンセル"、
+        error="1チャンク目タイムアウトにより自動キャンセル" として返す
+      - チャンク1以降で例外発生: そのチャンクは元座標を保持し、
+        エラーメッセージを蓄積して処理を継続する
+      - 全チャンク完了時: n_snapped > 0 なら status="完了"、
+        0件なら status="エラー"
+      - on_progress は各チャンク処理後に
+        {chunk_idx, total_chunks, n_snapped, status, error} 相当の
+        情報で呼び出す（MapMatchingWorkerの進捗シグナル用。4-12節）
+
+  gpxpy連携アダプタ（時刻・標高を保持する層。gpx-vsync固有）:
+
+  - @dataclass GpxMatchResult:
+      points: list[gpxpy.gpx.GPXTrackPoint]
+      n_snapped: int
+      status: str
+      error: str | None
+
+  - match_gpx_points(points: list[gpxpy.gpx.GPXTrackPoint],
+                     on_progress=None, should_cancel=None,
+                     match_chunk_impl=match_chunk,
+                     sleep_impl=time.sleep
+                    ) -> GpxMatchResult
+    1. coords = [(p.latitude, p.longitude) for p in points]（間引きなし）
+    2. result = match_route(coords, on_progress=on_progress,
+                            should_cancel=should_cancel,
+                            match_chunk_impl=match_chunk_impl,
+                            sleep_impl=sleep_impl)
+    3. points と result.matched_points を1:1でzipし、各点の
+       time/elevationは元のpointsから引き継いだ新しいGPXTrackPointの
+       リストを構築して返す（間引きが無いため、インデックスの
+       付け替え（旧kept_indices）は不要）
+       （座標のみ置き換え、時刻・標高は無変更）
+
+4-12. MapMatchingWorker / MapMatchingDialog
+      (app/map_matching_worker.py, app/map_matching_dialog.py)
+  GPX読み込み中にネットワークI/Oでメインスレッド（GUIイベントループ）を
+  ブロックしないためのQThreadラッパーと、進捗・キャンセルUI。
+  gpx-editorのuseMapMatching.js（React状態管理ラッパー）+
+  MapMatchingDialog.jsxに相当する。
+
+  - class MapMatchingWorker(QThread)
+      シグナル:
+        progress = pyqtSignal(int, int)  # chunk_idx, total_chunks
+        finished_matching = pyqtSignal(object)  # GpxMatchResult
+      コンストラクタ: MapMatchingWorker(points: list[GPXTrackPoint])
+      run(): map_matcher.match_gpx_points() を
+        on_progress=(進捗シグナルemit)、
+        should_cancel=(内部の threading.Event / bool フラグ参照)
+        で呼び出し、完了後 finished_matching をemitする
+      request_cancel(): 内部キャンセルフラグをTrueにする
+        （gpx-editorのuseMapMatching.jsのcancelRequestedRefと同じ
+        役割。次のチャンク処理前チェックで反映される）
+
+  - class MapMatchingDialog(QDialog)
+      モーダルダイアログ。「マップマッチング中」の見出し、
+      プログレスバー（chunk_idx/total_chunks）、
+      「キャンセル」ボタン（クリックでworker.request_cancel()を呼ぶ）
+      worker.progress シグナルに接続してプログレスバーを更新する
+      worker.finished_matching シグナルに接続して自動的に閉じる
+      （MainWindow.load_gpx()がこのシグナルで結果を受け取り、
+      GPXHandler.replace_points()を呼ぶ。4-1節）
+
+4-13. MapillaryValidator (app/mapillary_validator.py)
+  出力完了直後、生成された動画から実際にmapillary_toolsがGPS付き
+  画像相当データを取り出せるかをローカルで検証する（5-10節）。
+  mapillary_toolsのサーバーへは一切データを送信しない
+  （`video_process` はローカル処理のみのサブコマンド。10章参照）。
+
+  背景・実機検証で判明したこと（2026-07-13、mapillary_tools 0.14.7）:
+  - `video_process` の第2位置引数（import_path）でサンプル画像の
+    出力先ディレクトリを明示指定できる（省略時は
+    `{動画のディレクトリ}/mapillary_sampled_video_frames`）。これを
+    一時ディレクトリへ向けることで、出力動画のあるユーザーの
+    ディレクトリには一切副産物ファイルが生成されないことを実機で
+    確認済み（video_import_pathには最終出力動画のパスをそのまま
+    渡せばよく、コピーは不要）。
+  - GPSデータが全く取得できない場合（例: CAMM未埋め込み動画）は
+    終了コード3、desc.jsonファイル自体が生成されないことを実機で
+    確認済み。標準エラー出力に
+    "WARNING - No GPS data found from the video" が出る。
+  - 正常時は終了コード0、指定した --desc_path にJSON配列が
+    書き出される。各要素は MAPLatitude/MAPLongitude/
+    MAPCaptureTime/MAPFilename 等を持つ（実機出力で確認済み）。
+  - ログ行は `HH:MM:SS.mmm - <LEVEL> - <message>` 形式
+    （LEVELは INFO/WARNING/ERROR など、桁揃えのため空白パディング
+    あり）。ERROR/WARNING行の抽出には正規表現
+    `r"-\s*ERROR\s*-"` / `r"-\s*WARNING\s*-"` を用いる。
+
+  - is_mapillary_tools_available() -> bool
+      shutil.which("mapillary_tools") is not None
+
+  - @dataclass ValidationResult:
+      ok: bool
+      n_images: int
+      errors: list[str]
+      warnings: list[str]
+
+  - validate_export(video_path: str, video_start_time: str,
+                    should_cancel: Callable[[], bool] | None = None
+                   ) -> ValidationResult
+    1. tempfile.TemporaryDirectory() 内に samples_dir・desc_path を
+       用意する
+    2. subprocess.Popen で以下を実行する（Popenを使うのは
+       should_cancel() による途中終了(terminate())に対応するため）:
+         mapillary_tools video_process <video_path> <samples_dir>
+             --geotag_source exif
+             --video_start_time <video_start_time>
+             --video_sample_distance 3
+             --video_sample_interval -1
+             --desc_path <desc_path>
+       短い間隔でプロセスの生死をポーリングしつつ should_cancel() を
+       確認し、Trueならprocess.terminate()した上で
+       ValidationResult(ok=False, n_images=0, errors=[],
+       warnings=[], ※cancelled扱いは呼び出し側のstatusで区別)を返す
+    3. 標準エラー出力をログ行ごとに走査し、ERROR/WARNING行を
+       それぞれ errors/warnings リストに集める
+    4. 終了コードが0以外、または desc_path が存在しない場合:
+       ok=False（errorsが空ならstderr全体を1件として格納する）
+    5. desc_path を読み込み、JSON配列の要素数を n_images とする。
+       n_images == 0 の場合も ok=False とする
+    6. 一時ディレクトリ（samples_dir・desc_path含む）は
+       with文終了時に自動削除される
+
+4-14. MapillaryValidationWorker / MapillaryValidationDialog
+      (app/mapillary_validation_worker.py,
+       app/mapillary_validation_dialog.py)
+  4-12節のMapMatchingWorker/MapMatchingDialogと同一パターン
+  （QThread + モーダルダイアログでのブロッキング待機）。
+
+  - class MapillaryValidationWorker(QThread)
+      シグナル:
+        finished_validation = pyqtSignal(object)  # ValidationResult | None
+        （Noneはキャンセルを表す）
+      コンストラクタ: MapillaryValidationWorker(video_path: str,
+                                              video_start_time: str)
+      run(): mapillary_validator.validate_export() を
+        should_cancel=(内部の threading.Event 参照) で呼び出し、
+        完了後 finished_validation をemitする
+      request_cancel(): 内部キャンセルフラグをTrueにする
+
+  - class MapillaryValidationDialog(QDialog)
+      モーダルダイアログ。「ローカル検証中」の見出し、
+      不定形（busy）プログレスバー（QProgressBar.setRange(0, 0)。
+      mapillary_tools側から細かい進捗が取得できないため）、
+      「キャンセル」ボタン（クリックでworker.request_cancel()を呼ぶ）
+      worker.finished_validation シグナルに接続して自動的に閉じる
+
+4-15. time_utils (app/time_utils.py)
+  - モジュール関数のみ、クラスは持たない
+  - playback_ms_to_real_ms(ms: int, time_scale: float) -> int
+      return round(ms * time_scale)
+    動画の再生位置(ms)を実世界での経過時間(ms)に変換する単純な純関数。
+    GPXHandler.interpolate_position()・MainWindow.on_force_sync_clicked()・
+    Exporter.get_video_start_time_str() から使う共通ロジック（15章）。
+  - real_ms_to_playback_ms(real_ms: int, time_scale: float) -> int
+      return round(real_ms / time_scale)
+    playback_ms_to_real_ms()の逆変換。実世界での経過時間(ms)を、動画
+    自身の圧縮されたネイティブな再生タイムライン上の位置(ms)に戻す。
+    GPXHandler.get_points_for_camm()がCAMMサンプルの配置位置
+    （relative_ms）を計算する際に使う（15章フェーズ2）。
+
+4-16. TimelapseWidget (app/timelapse_widget.py)
+  - QWidget を継承
+  - 配置: MainWindow右ペイン、VideoWidget（タイムライン含む）の下
+  - 構成要素:
+      QCheckBox      # 「タイムラプス動画」チェックボックス（既定OFF）
+      QDoubleSpinBox # 間隔入力欄（秒。範囲0.01〜3600.0、既定0.5、
+                     # 小数点2桁、チェックがONの時のみ有効化）
+  - シグナル:
+      timelapse_changed(enabled: bool, interval_sec: float)
+        チェックボックスのtoggle時、および有効化中の間隔値変更時に発火
+  - メソッド:
+      timelapse_enabled() -> bool
+      interval_seconds() -> float
+      reset() -> None
+        動画差し替え時にMainWindow.load_video()から呼ばれる。
+        チェックボックスOFF・間隔を既定値(0.5)に戻し、
+        timelapse_changed(False, 0.5) を1回だけ発火する。
+        内部実装注記: チェックボックスと間隔入力を個別に
+        setChecked()/setValue()すると、両方がシグナル発火対象になり
+        中間状態（例: enabled=True, interval=0.5 という到達しない
+        はずの組み合わせ）が一瞬発火してしまう不具合を実装時に
+        確認した。そのため reset() 内では両ウィジェットの
+        blockSignals(True) で一時的にシグナルを止めて最終状態に
+        更新し、その後に timelapse_changed を手動で1回だけ発火する
+        実装とする。
+
+
+5. 動画とマップの連携ロジック
+----------------------------------------------------------------
+
+  QMediaPlayer.positionChanged シグナルを使い、
+  再生位置（ミリ秒）が変わるたびに以下を実行する:
+
+    def on_position_changed(self, ms: int):
+        # Start/End 範囲チェック
+        if ms >= self.state.video_end_ms:
+            self.player.pause()
+            self.player.setPosition(self.state.video_end_ms)
+            return
+        # マップマーカー更新（video_time_scaleはタイムラプス対応。15章。
+        # 通常動画では1.0のままなので従来と同じ挙動になる）
+        pos = self.gpx_handler.interpolate_position(
+            ms,
+            self.state.offset_seconds,
+            self.state.video_creation_time,
+            self.state.video_time_scale
+        )
+        if pos:
+            self.map_widget.update_marker(*pos)
+        else:
+            # GPXの記録範囲外の場合はマーカーを非表示にする
+            self.map_widget.hide_marker()
+        # タイムライン更新
+        self.video_widget.timeline.set_position(ms)
+
+  更新頻度: 実機検証（PyQt6 6.11.0 / Qt 6.11.1、macOS）では positionChanged は
+  数十ms間隔（実測30〜70ms程度）で頻繁に発火することを確認した
+  （旧版の「約200ms間隔」という記述は不正確だったため訂正）。
+  マップのJS呼び出しはその都度行ってもよいが、頻度が高いため、
+  必要であれば間引き（例: 前回呼び出しから100ms未満ならスキップ）を
+  検討してもよい。
+
+
+6. 動画開始時刻の扱い
+----------------------------------------------------------------
+
+  GPXと動画を紐付けるために「動画の録画開始時刻（絶対時刻）」が必要。
+  なお、GPXは動画より先に読み込まれていることが前提（4-1参照）なので、
+  以下のいずれの場合でも gpx_data は必ず利用可能である。
+
+  取得方法（優先順）:
+  1. ffprobeのメタデータから取得
+       format.tags.creation_time (ISO8601, UTC)
+  2. メタデータがない場合: UIに入力フォームを表示し手動入力させる
+       - 入力値はローカル時刻として扱う
+       - 入力欄の初期値には、GPXの最初のトラックポイント時刻
+         （UTC）をシステムのタイムゾーンでローカル時刻に変換した値を
+         プリフィルする
+       - ユーザーはこの初期値を確認・修正した上で確定する
+       - 確定後、システムのタイムゾーンを使ってUTCに変換し、
+         内部的にはUTCの video_creation_time として保持する
+
+  動画上の任意の再生位置（ms）に対応するGPX時刻:
+    gpx_time = video_creation_time
+               + timedelta(milliseconds=video_start_ms)  ← Startマーカー分
+               + timedelta(milliseconds=current_pos_ms - video_start_ms)
+               + timedelta(seconds=offset_seconds)
+
+
+7. Startマーカー・Endマーカーの実装詳細
+----------------------------------------------------------------
+
+  CustomTimeline の paintEvent:
+    - バー全体をグレーで描画
+    - Start〜End 区間をハイライト（青系）
+    - 現在位置を赤い縦線で描画
+    - Start: 緑の下向き三角ハンドル
+    - End:   赤の下向き三角ハンドル
+
+  ドラッグ判定:
+    マウスダウン時に Start/End ハンドルとの距離を判定し、
+    近い方をドラッグ対象にする（10px以内など）
+
+  制約チェック:
+    - Start < End（逆転不可）
+    - Start >= 0
+    - End <= duration
+
+  End到達時の挙動:
+    - 現在位置がEndに達したら一時停止し、End位置に固定する
+      （Startには戻らない。ループ再生は行わない）
+
+
+8. レイアウト詳細
+----------------------------------------------------------------
+
+  QMainWindow
+  └── QWidget (central)
+      └── QVBoxLayout
+          ├── QSplitter (horizontal)
+          │   ├── QWidget (左ペイン)
+          │   │   └── QVBoxLayout
+          │   │       ├── MapWidget          ← stretch: 1
+          │   │       └── OffsetWidget       ← fixed height
+          │   └── QWidget (右ペイン)
+          │       └── QVBoxLayout
+          │           ├── QVideoWidget       ← stretch: 1
+          │           └── CustomTimeline     ← fixed height ~80px
+          └── QHBoxLayout (ボタン行)
+              ├── QPushButton("▶ 再生")
+              ├── QPushButton("⏸ 一時停止")
+              ├── QLabel (現在時刻表示)
+              ├── QSpacerItem
+              └── QPushButton("📤 Export & Test")
+
+  初期ウィンドウサイズ: 1280 x 720
+  左右ペインの初期比率: 1:1
+
+
+9. map_template.html の構成
+----------------------------------------------------------------
+
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+      body { margin: 0; padding: 0; }
+      #map { width: 100%; height: 100vh; }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <script>
+      var map = L.map('map').setView([35.0, 135.0], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a> contributors'
+      }).addTo(map);
+
+      var routeLine = null;
+      var marker = null;
+
+      function loadRoute(latlngs) {
+          if (routeLine) map.removeLayer(routeLine);
+          routeLine = L.polyline(latlngs, {color: 'blue', weight: 3}).addTo(map);
+          map.fitBounds(routeLine.getBounds());
+      }
+
+      function updateMarker(lat, lon) {
+          if (!marker) {
+              marker = L.circleMarker([lat, lon], {
+                  radius: 8, color: 'red', fillColor: '#f03',
+                  fillOpacity: 0.8
+              }).addTo(map);
+          } else {
+              marker.setLatLng([lat, lon]);
+              marker.setStyle({opacity: 1, fillOpacity: 0.8});
+          }
+          map.panTo([lat, lon]);
+      }
+
+      function hideMarker() {
+          if (marker) {
+              marker.setStyle({opacity: 0, fillOpacity: 0});
+          }
+      }
+
+      function clearMap() {
+          if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+          if (marker) { map.removeLayer(marker); marker = null; }
+      }
+    </script>
+  </body>
+  </html>
+
+  Python側からの呼び出し例:
+    page.runJavaScript(f"loadRoute({json.dumps(latlngs)});")
+    page.runJavaScript(f"updateMarker({lat}, {lon});")
+    page.runJavaScript("hideMarker();")
+    page.runJavaScript("clearMap();")
+
+
+10. mapillary_toolsとの連携
+----------------------------------------------------------------
+
+  Step 8にて mapillary_tools 0.14.7 を実際にインストールし、
+  `mapillary_tools video_process_and_upload --help` で正確な
+  CLIオプションを検証済み（ドキュメント頼りではなく実コマンドで確認）。
+
+  本ツールの出力ファイルを使ったアップロードコマンド（出力ダイアログに表示）:
+
+    mapillary_tools video_process_and_upload <output.mp4> \
+        --geotag_source exif \
+        --video_start_time <YYYY_MM_DD_HH_MM_SS_sss> \
+        --video_sample_distance 3 \
+        --video_sample_interval -1
+
+  --geotag_source を採用した経緯（GPX直接参照方式からの変更）:
+    当初は --geotag_source gpx + --geotag_source_path <出力GPX> という
+    構成だったが、検討の過程で「動画自体にGPSを埋め込む方が
+    Mapillaryのメインストリームな使われ方（GoPro等のGPS内蔵動画を
+    直接アップロードする運用）に近い」という指摘を受け、4-8節の
+    CammEncoderで動画自体にCAMM形式のGPSトラックを埋め込む方式に
+    変更した。実機検証で、自前生成したCAMMトラックを正しく読み取れ、
+    座標が期待値と完全に一致することを確認済み（詳細は4-8節）。
+    この方式では --geotag_source_path（外部GPXファイルの指定）は
+    不要になる。ただし出力されるGPXファイル自体は、バックアップ・
+    手動確認用として引き続き生成する（spec.txt 5-6節）。
+
+  サンプリング方式・geotag_sourceについて（フェーズ2で
+  時間ベース+camm → 距離ベース+exif に変更。15章のタイムラプス対応
+  調査で判明した内容に基づく）:
+    `mapillary_tools video_process` は内部で「sample_video」（動画から
+    静止画を抽出しEXIFに時刻を書く）→「process」（--geotag_sourceで
+    指定した方法でジオタグ付けする）の2段階に分かれている。
+    2026-07-13の実機・ソースコード調査（mapillary_tools 0.14.7の
+    sample_video.py・camm/camm_parser.py・geotag/geotag_images_from_gpx.py
+    を直接確認）で以下が判明した:
+      - `--video_sample_distance -1 --video_sample_interval N`
+        （時間ベース）でのsample_videoは、CAMM/GPS情報を一切参照せず
+        単純に "video_start_time + フレーム番号×interval" で時刻を
+        決める（sample_video.py の _sample_single_video_by_interval）。
+        後続の process --geotag_source camm が別途CAMMを読み直して
+        位置を付与するが、その際 use_image_start_time=True の実装が
+        CAMMサンプルのtime_gps_epochを保持したまま扱わず、素の
+        geo.Point型に作り直してしまう（geotag_images_from_gpx.py）ため、
+        タイムラプス動画（15章）では time_gps_epoch が失われ、
+        圧縮されたネイティブ時間ベースの誤った時刻になってしまう。
+      - 一方 `--video_sample_distance N --video_sample_interval -1`
+        （距離ベース）でのsample_videoは、CAMMの各GPS点を直接読み、
+        `interp.get_gps_epoch_time()`（sample_video.py内、コメントに
+        "Try to use GPS epoch time if available (for timelapse videos)"
+        とある）でtime_gps_epochが取得できればそれを直接採用して
+        画像EXIFに位置・時刻を書き込む。この時点で位置・時刻付けは
+        完結しているため、後続processでは --geotag_source exif
+        （EXIFの値をそのまま信用する）を指定し、camm による再読込・
+        上書きをさせない。
+      - 旧Type 5（MIN_GPS）のCAMM実装では距離ベースサンプリングが
+        "No GPS data found from the video" で失敗していたが、
+        Type 6（GPS、time_gps_epoch付き）に切り替えたところ問題なく
+        動作することを実機で確認した（4-8節）。
+      - 実機検証（2026-07-13）: 実世界0.5秒間隔・fps=30相当
+        （time_scale=15）のタイムラプスを模したCAMM Type6テスト
+        ファイルで、上記の距離ベース+exif方式ではMAPCaptureTimeが
+        正しく実世界の時間軸（例: 25秒間隔の点が25秒間隔のまま）に
+        展開されることを確認。誤った時間ベース+camm方式では
+        "distance gap too large" 警告と共に移動速度が実際の約15倍に
+        見える壊れ方をすることも合わせて確認した。
+      - 通常動画（video_time_scale=1.0）でも同じ距離ベース+exif方式で
+        回帰が無いことを実機確認済み（15章）。そのため通常動画・
+        タイムラプス動画を問わず、常にこの方式を使う（動画の種類に
+        応じてコマンドを出し分ける必要はない）。
+
+  --video_start_time について（必須。ファイル内メタデータに依存しない）:
+    トリミング後の動画の実際の録画開始時刻
+    （video_creation_time + playback_ms_to_real_ms(video_start_ms,
+    video_time_scale)、UTC。15章のタイムラプス対応込み）を
+    "YYYY_MM_DD_HH_MM_SS_sss" 形式（ミリ秒精度、例: 2026_07_12_01_00_02_500）
+    で指定する。Exporter.get_video_start_time_str()（4-9節）で計算し、
+    build_mapillary_tools_command() から使う。
+    理由: 4-8節の通り、MP4Boxでのトラック追加処理により動画の
+    creation_timeメタデータが不正な値（処理実行時刻）に上書きされて
+    しまうため、動画ファイル内のメタデータには一切頼らず、
+    コマンド引数で明示的に正しい時刻を渡す設計とする。実機検証で
+    --video_start_time を指定すれば、ファイル内のcreation_timeが
+    不正でも正しくジオタグできることを確認済み。
+
+  注意: GPXのタイムスタンプ・CAMMトラックの時刻は動画の実際の
+  録画時刻に合わせてあるため、--interpolation_offset_time は
+  不要（本ツールで同期済みのため）。
+
+  出力後のローカル検証について（5-10節・4-13節・4-14節）:
+    アップロード自体には「公開せずデータ十分性だけ判定する」専用
+    モードが無いことを2026-07-13にmapillary_tools 0.14.7のソース
+    （uploader.py の finish_upload()）を直接確認して把握した。
+    `--dry_run` はサーバーへ一切送らないローカルシミュレーション、
+    `--nofinish` はサーバーへ送るが `finish_upload` API呼び出しを
+    スキップするだけで、どちらもサーバー側のデータ検証結果は得られ
+    ない。実質的な検証はアップロード前のローカル処理
+    （`video_process`、ネットワーク送信なし）で完結しているため、
+    本ツールはこれを出力操作に自動統合する（4-13節）。
+
+
+11. エラーハンドリング
+----------------------------------------------------------------
+
+  - FFmpegが見つからない場合: 起動時チェックしてダイアログ表示
+  - MP4Box（GPAC）が見つからない場合: 起動時チェックしてダイアログ表示
+    （FFmpegと同様。brew install gpac を案内する）
+  - 動画にcreation_timeがない場合: 手動入力フォームを表示
+    （初期値はGPX開始時刻のローカル時刻換算値をプリフィル）
+  - GPXとオフセット適用後に時刻範囲が重複しない場合: 警告を表示し、
+    出力ボタンを無効化する（重複するまで出力不可）
+  - ネットワーク不通時（OSMタイル取得失敗）: マップ無表示でも動作継続
+  - マップマッチングAPI（13章）に到達できない場合: 1チャンク目失敗なら
+    元座標のまま、2チャンク目以降の部分失敗ならそのチャンクのみ
+    元座標のまま、GPX読み込み自体は継続する（5-9節・4-11節）
+  - mapillary_toolsが見つからない場合（出力後ローカル検証時）:
+    起動時チェックの対象にはせず（FFmpeg/MP4Boxと異なり必須外部
+    ツールではないため）、出力完了時に検証をスキップし、その旨を
+    完了メッセージに表示するのみとする（5-10節・4-13節）
+  - タイムラプス設定が有効な場合（video_time_scale != 1.0）:
+    フェーズ2（15章）でCAMM Type6のtime_gps_epoch対応により出力・
+    Mapillary連携も通常動画と同様に動作するため、特別なブロックは
+    行わない。GPXとオフセット適用後の実時刻範囲（video_time_scale
+    考慮済み）が動画Start〜Endと重複しない場合にのみ、上記と同じ
+    ロジックで出力ボタンが無効化される。
+
+
+12. 開発・実行手順
+----------------------------------------------------------------
+
+  # 環境構築
+  brew install ffmpeg gpac
+  python -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+
+  # 実行
+  python main.py
+
+  # requirements.txt
+  PyQt6>=6.11.0
+  PyQt6-WebEngine>=6.11.0
+  gpxpy>=1.6.2
+  requests>=2.32.0
+
+  # デスクトップからの起動（簡易ランチャー）
+  video_gpx_sync/GPX-VSync.app を Finder でダブルクリックすると、
+  .venv を activate した上で main.py が起動する。Desktop等への
+  エイリアス作成は任意（元の video_gpx_sync/GPX-VSync.app 自体を
+  移動すると相対パス解決が壊れるため、移動する場合はエイリアス
+  （シンボリックリンクではなくFinderの「エイリアスを作成」）を使うこと）。
+  FinderからのGUI起動ではHomebrewのPATHが通っていないため、
+  起動スクリプト内で /opt/homebrew/bin を明示的にPATHへ追加している。
+
+
+13. マップマッチングAPI連携（外部サービス仕様）
+----------------------------------------------------------------
+
+  姉妹プロジェクト ../gpx-editor（React/JS版マップマッチング機能）と
+  同じ外部API・パラメータを採用する。2026-07-13にAPI公式ドキュメント
+  （valhalla.github.io/valhalla）およびFOSSGIS e.V.の利用ポリシーを
+  直接確認済み（1章参照）。
+
+  エンドポイント:
+    POST https://valhalla1.openstreetmap.de/trace_attributes
+    （FOSSGIS e.V. 運営の公開デモサーバー。本番サービスではなく
+    デモ・検証用途と明記されている点に注意）
+
+  リクエストボディ（JSON）:
+    {
+      "shape": [{"lat": <float>, "lon": <float>}, ...],
+      "costing": "bicycle",
+      "shape_match": "map_snap",
+      "search_radius": 50,
+      "filters": {
+        "attributes": ["matched.point", "matched.type"],
+        "action": "include"
+      }
+    }
+    - shape: 1リクエストあたり50点以下（4-11節のCHUNK_SIZE）
+    - costing: "bicycle"固定（本ツールの想定用途が自転車走行のため。
+      gpx-editorと同一）
+    - shape_match: "map_snap"固定（GPSトレースを道路網へスナップする
+      モード。他に"edge_walk"/"walk_or_snap"があるが未使用）
+    - search_radius: 50（メートル。道路候補の探索半径。API仕様上の
+      上限は100m）
+
+  リクエストヘッダ:
+    Content-Type: application/json
+    X-Client-Id: gpx-vsync
+    （公開デモサーバーのfair-useポリシーで、公開アプリからの
+    リクエストには識別用ヘッダーの付与が推奨されている。
+    gpx-editor側には未実装だが、今回のPython実装では追加する）
+
+  タイムアウト: 1リクエストあたり30秒（4-11節のmatch_chunk）
+
+  レスポンスボディ（JSON、抜粋。filtersで絞り込み済み）:
+    {
+      "matched_points": [
+        {"lat": <float>, "lon": <float>, "type": "matched"},
+        {"lat": <float>, "lon": <float>, "type": "interpolated"},
+        {"type": "unmatched"},
+        ...
+      ],
+      ...
+    }
+    - matched_points は shape と同じ順序・同じ点数で返る
+    - type:
+        "matched"      道路上に正しくスナップできた点
+        "interpolated" 前後のmatched点から補間された点
+        "unmatched"    スナップできなかった点（lat/lonフィールドなし）
+    - 本ツールでは matched/interpolated の座標のみ採用し、
+      unmatchedは元座標を保持する（4-11節の apply_matched_points()）
+
+  レート制限・fair-use（FOSSGIS e.V.の公開ポリシーより）:
+    - 1ユーザーあたり1リクエスト/秒、サーバー全体で100リクエスト/秒
+    - 公開アプリは Github Discussions での告知と X-Client-Id
+      ヘッダーでの識別が求められている
+    - 本サーバーはデモ・検証用途であり本番サービスとしての
+      安定性は保証されないため、5-9節・11章のエラーハンドリング
+      （タイムアウト時は元座標へフォールバック）を必ず実装すること
+    - 2026-07-14変更: 当初はRDP間引きによりチャンク数が少なく
+      （多くの場合1チャンクのみ）実質的に1req/秒を超えることは
+      稀だったが、間引きを廃止した（4-11節）ことでチャンク数が
+      増えるため、match_route()にMIN_REQUEST_INTERVAL_SEC=1.0の
+      明示的なレート制限を追加し、チャンク送信間隔が1秒を
+      下回らないようにした
+
+  参考: gpx-editorのspec.txt 17-2章・10章にも同一APIの仕様が
+  ドキュメント化されている（本プロジェクトの設計はそれを踏襲）。
+
+
+15. タイムラプス動画対応
+----------------------------------------------------------------
+
+  背景（spec.txt 5-11節）:
+    タイムラプス動画（例: 実世界0.5秒間隔で撮影したフレームを
+    29.97fps等の通常フレームレートでコンテナ化したもの）は、
+    「動画の再生位置(ms) = 実世界の経過時間」という、本ツールの
+    時刻同期ロジック全体が前提としている等速関係が成り立たない
+    （上記の例では、再生1秒 ≒ 実世界約15秒相当になる）。
+
+  タイムラプスの自動判定について（2026-07-13、WebSearch/WebFetch
+  による実地調査済み。記憶に頼った実装をしないというプロジェクト
+  ルールに基づく）:
+    - MP4/MOVコンテナには「タイムラプスである」ことを示す標準的な
+      メタデータフィールドは存在しない。ffprobeで汎用的に読み取れる
+      項目はない。
+    - GoPro純正機の未加工(raw)ファイルにはGPMFメタデータストリーム
+      内に `GoPro:Rate` タグ（例: "2_1SEC" = 0.5秒間隔）が存在するが、
+      (a) ffprobe単体では読めずGPMF専用パーサが必要、
+      (b) GoPro Player/Studioでの書き出しや再エンコードで消失する、
+      という制約があり、本ツールが読み込む動画（編集・変換済みの
+      可能性が高い）には期待できない。
+    - 「音声トラックが無い」ことはタイムラプス動画によくある特徴だが、
+      無音の通常動画も存在するため誤検知リスクが高く、自動補正の
+      根拠にはできない（弱いヒントとしてのみ利用する）。
+    - 結論: 確実な自動判定は一般に不可能。ユーザーによる明示指定を
+      基本とし、音声トラック無しの場合のみ注意喚起ヒントを表示する
+      （4-1節 load_video()）。
+    参考: The Quirks of GoPro Metadata (GPMD) | Trek View
+    (https://www.trekview.org/blog/gopro-camera-modes-metadata-tests/),
+    Turning a GoPro TimeLapse Video into Photo Frames | Trek View
+    (https://www.trekview.org/blog/turn-gopro-timelapse-video-into-timelapse-images/)
+
+  フェーズ1のスコープ（プレビュー同期・強制同期・再生レート）:
+    - AppState.video_time_scale（再生1msあたりの実世界ms数。通常
+      動画は1.0）を導入し、以下に適用した:
+        GPXHandler.interpolate_position()（プレビューのマーカー位置）
+        MainWindow.on_force_sync_clicked()（強制同期ボタン）
+        MainWindow._apply_playback_rate()（自動再生の速度）
+    - この時点ではGPXHandler.export_trimmed() / get_points_for_camm() /
+      _build_output_points() / _raw_time_range() / has_overlap()は
+      変更せず、CAMM埋め込み・Mapillary連携（Export & Testボタン）は
+      タイムラプス設定有効時は無効化した（フェーズ2で解消。下記）。
+
+  フェーズ2: CAMM Type 6 (time_gps_epoch) によるMapillary連携対応
+  （2026-07-13、実機検証で設計を確定・実装済み）:
+
+    調査のきっかけ: 「動画にGPSを埋め込む設計にしたので、埋め込む
+    GPS情報のタイミングさえ合っていれば動画自体のfpsとは無関係に
+    正しく扱えるのでは」「Mapillaryはタイムラプス撮影
+    （例: 自転車で0.5秒間隔）を元々想定しているはず」という指摘を
+    受け、mapillary_tools 0.14.7のソースコードを直接確認した。
+
+    発見1（sample_video.py）: `_sample_single_video_by_distance()`
+    内に "Try to use GPS epoch time if available (for timelapse
+    videos)" というコメント付きの分岐があり、GPS点が
+    `get_gps_epoch_time()`（絶対UTCエポック秒）を持っていれば、
+    動画のfps・PTSと無関係にそれをそのまま画像のMAPCaptureTimeとして
+    採用する。この仕組みはCAMM Type 6（GPS。telemetry.CAMMGPSPointの
+    time_gps_epochフィールド）でのみ機能し、当時使っていたType 5
+    （MIN_GPS）には時刻フィールド自体が無いため常にフォールバック
+    （video_start_time + 動画のネイティブ時間）に落ち、タイムラプス
+    動画では圧縮された誤った時刻になっていた。
+
+    発見2（サンプリング方式の依存関係）: `video_process`は
+    「sample_video」→「process」の2段階に分かれており、
+    time_gps_epochが実際に使われるのは **距離ベース**
+    （--video_sample_distance N --video_sample_interval -1）の
+    sample_videoのみ。**時間ベース**
+    （--video_sample_distance -1 --video_sample_interval N、
+    本ツールが元々使っていた方式）のsample_videoはCAMM/GPSを一切
+    参照しない別のコードパスであり、後続のprocess --geotag_source
+    camm が改めてCAMMを読み直して上書きするが、その実装
+    （geotag_images_from_gpx.py の use_image_start_time=True 分岐）は
+    time_gps_epochを保持しないただのgeo.Pointに作り直してしまうため、
+    タイムラプス動画では時刻が壊れる。よって
+    「距離ベースサンプリング + --geotag_source exif」への変更が
+    必須と判明した（10章）。
+
+    発見3（旧Type 5で距離ベースが失敗していた理由）: 4-8節の通り、
+    旧実装ではCAMM Type 5で距離ベースサンプリングを試すと
+    "No GPS data found from the video" で失敗し、時間ベースに
+    回避していた（implement.txt旧版に記録あり）。Type 6へ切り替えた
+    ところ、この問題が再現せず正常に動作することを実機で確認した
+    （根本原因の完全な特定はできていないが、Type 6への切り替えで
+    実用上解消したため、これ以上の深追いはしていない）。
+
+    実機検証結果（2026-07-13、合成CAMM Type6テストファイルで確認）:
+      - 実世界0.5秒間隔・fps=30相当（time_scale=15、ネイティブ10秒の
+        動画が実世界150秒分のデータを表す想定）のタイムラプスで、
+        distance方式+--geotag_source exifなら、MAPCaptureTimeが
+        正しく実世界の時間軸（25秒間隔の点は25秒間隔のまま）に展開
+        され、MapillaryOutsideGPXTrackErrorも発生しないことを確認。
+      - 同じテストファイルで --geotag_source camm のままにすると、
+        time_gps_epochが失われて時刻が圧縮され、
+        MapillaryOutsideGPXTrackError多発・移動速度異常
+        （"distance gap too large"警告）という壊れ方をすることも
+        合わせて確認（詳細はtests/test_mapillary_validator.pyの
+        test_validate_export_succeeds_for_timelapse_video）。
+      - 通常動画（time_scale=1.0）でも同じdistance+exif方式で
+        既存のTest 5相当の結果と一致し、回帰が無いことを確認した。
+
+    設計変更点（4-6節・4-8節・4-9節・4-13節・10章に反映済み）:
+      - camm_encoder.py: CAMM Type 5 → Type 6（time_gps_epoch付き）
+      - gpx_handler.py get_points_for_camm(): 戻り値に epoch_time を
+        追加。relative_msは「動画自身の圧縮されたネイティブな
+        再生タイムライン上の位置」（real_ms_to_playback_ms()で
+        実世界時間から逆変換）のまま維持し、epoch_timeで実時刻を
+        別途伝える、という2軸に分離した設計とした
+      - exporter.py・mapillary_validator.py: コマンドを
+        `--geotag_source camm --video_sample_distance -1
+        --video_sample_interval 2` から
+        `--geotag_source exif --video_sample_distance 3
+        --video_sample_interval -1` に変更
+      - main_window.py: タイムラプス設定有効時の出力ボタン強制無効化
+        を撤廃。GPXとの実時刻範囲重複判定（has_overlap、
+        video_time_scale考慮済み）のみで判定する
+
+  再生レート同期（実機検証済み、2026-07-13）:
+    タイムラプス設定有効時、MainWindow._apply_playback_rate()で
+    player.setPlaybackRate(1.0 / video_time_scale) を設定する
+    （例: 0.5秒間隔・29.97fps → 約0.067倍速 = 見かけ上2fps相当）。
+    実機検証（PyQt6/Qt6.11、macOS、FFmpegベースのQt Multimedia
+    バックエンド）で、0.0667倍速のような極端に遅いplaybackRateでも
+    エラー無く動作し（Error.NoError）、player.position()が経過時間に
+    ほぼ比例して進行することを確認した（6秒間の実時間再生で
+    約371ms分のPTSが進行、理論値約406msと概ね一致。タイマー精度上の
+    誤差の範囲）。音声は極端な低速再生では意味を持たないため、
+    タイムラプス有効時は自動的にミュートする。
+    この方式では「▶ 再生」ボタンでの自動再生が実時間ベースになる
+    ため、圧縮倍率が大きいタイムラプスほど視聴に長い実時間がかかる
+    （例: 15倍圧縮なら動画本編4分の内容を実時間で約60分かけて
+    再生することになる）。タイムライン上のドラッグによる手動シークは
+    再生レートの影響を受けず瞬時に位置を移動できるため、確認作業
+    自体はドラッグ操作で行うことを想定している。
+
+  UIの視認性改善（2026-07-13。動画読み込み時の確認ダイアログ追加）:
+    フェーズ1で追加した常設の「タイムラプス動画」設定
+    （動画タイムラインの下、4-16節TimelapseWidget）が、実際に使って
+    もらったところ「どこにあるかわからない」というフィードバックを
+    受けた。headless環境でMainWindowを実際に起動しスクリーンショットを
+    撮って確認したところ、ウィジェット自体は正しく描画されていたが、
+    動画プレビューという視線が集まる領域から離れた、小さく目立たない
+    場所に配置されていたことが原因と判明した。
+    当初は「動画を開く」ネイティブファイルダイアログ自体に
+    チェックボックスを追加することを検討したが、Qtの調査により
+    macOSのネイティブファイルダイアログにはカスタムウィジェットを
+    直接追加できず（DontUseNativeDialogでQt標準スタイルの
+    ダイアログに切り替える必要があり、Finder風の見た目が失われる）
+    ことが判明したため、代わりに動画選択直後に表示される軽量な
+    確認ダイアログ（_prompt_timelapse_settings()、4-1節）を追加する
+    方式を採用した。常設コントロール自体は、読み込み後に設定を
+    変更したい場合のために引き続き残している。
+
+================================================================
+                              以上
+================================================================

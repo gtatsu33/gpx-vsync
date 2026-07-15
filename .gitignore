@@ -1,0 +1,6 @@
+.DS_Store
+video_gpx_sync/.venv/
+**/__pycache__/
+*.pyc
+video_gpx_sync/.pytest_cache/
+video_gpx_sync/GPX-VSync.app/
