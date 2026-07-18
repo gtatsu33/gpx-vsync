@@ -16,7 +16,8 @@ MAPILLARY_TOOLS_COMMAND_TEMPLATE = (
     "    --geotag_source exif \\\n"
     "    --video_start_time {video_start_time} \\\n"
     "    --video_sample_distance 3 \\\n"
-    "    --video_sample_interval -1"
+    "    --video_sample_interval -1 \\\n"
+    "    --filetypes image"
 )
 
 
@@ -137,9 +138,16 @@ class Exporter:
         return format_video_start_time(synced_start_time)
 
     def build_mapillary_tools_command(
-        self, state: AppState, video_output_path: str, gpx_output_path: str
+        self,
+        state: AppState,
+        video_output_path: str,
+        gpx_output_path: str,
+        user_name: str | None = None,
     ) -> str:
-        return MAPILLARY_TOOLS_COMMAND_TEMPLATE.format(
+        command = MAPILLARY_TOOLS_COMMAND_TEMPLATE.format(
             video_path=video_output_path,
             video_start_time=self.get_video_start_time_str(state),
         )
+        if user_name:
+            command += f" \\\n    --user_name {user_name}"
+        return command

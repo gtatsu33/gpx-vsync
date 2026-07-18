@@ -93,6 +93,54 @@ def test_export_trimmed_boundaries_exactly_on_keyframes(
     assert frame_count == expected_frames
 
 
+def test_export_trimmed_smart_cut_has_no_audio_track(
+    handler: VideoHandler, tmp_path
+) -> None:
+    """出力にmapillary_tools向けには不要な音声を含めない（2026-07-18）。
+    音声トラックだけ映像より僅かに長く残り、コンテナ全体の長さが
+    映像・GPSデータの実長より長くなる不具合の原因でもあった。"""
+    output_path = tmp_path / "trimmed_no_audio.mp4"
+    # SAMPLE_MP4(sample.mp4)は音声トラック有り。3分割スマートカットの
+    # 経路（区間B: _copy_segment_by_frames）でも音声が混入しないことを
+    # 確認する
+    handler.export_trimmed(SAMPLE_MP4, str(output_path), start_ms=2500, end_ms=7300)
+
+    codec_types = [
+        stream["codec_type"] for stream in handler.get_metadata(str(output_path))["streams"]
+    ]
+    assert "audio" not in codec_types
+    assert "video" in codec_types
+
+    # 音声が無ければ、コンテナ全体の長さ(format.duration)は映像の
+    # 長さと一致するはず（音声由来の水増しが起きない）
+    video_stream_duration_ms = round(
+        float(
+            next(
+                s
+                for s in handler.get_metadata(str(output_path))["streams"]
+                if s["codec_type"] == "video"
+            )["duration"]
+        )
+        * 1000
+    )
+    assert handler.get_duration_ms(str(output_path)) == pytest.approx(
+        video_stream_duration_ms, abs=5
+    )
+
+
+def test_export_trimmed_single_gop_has_no_audio_track(
+    handler: VideoHandler, tmp_path
+) -> None:
+    output_path = tmp_path / "trimmed_single_gop_no_audio.mp4"
+    handler.export_trimmed(SAMPLE_MP4, str(output_path), start_ms=500, end_ms=1500)
+
+    codec_types = [
+        stream["codec_type"] for stream in handler.get_metadata(str(output_path))["streams"]
+    ]
+    assert "audio" not in codec_types
+    assert "video" in codec_types
+
+
 def test_has_audio_stream_true(handler: VideoHandler) -> None:
     assert handler.has_audio_stream(SAMPLE_MP4) is True
 

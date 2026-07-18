@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import datetime
+import time
 from typing import Callable
 
-from PyQt6.QtCore import QDateTime, QTimer, QUrl, Qt
+from PyQt6.QtCore import QDateTime, QSettings, QUrl, Qt
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -14,6 +15,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -31,9 +33,15 @@ from app.map_matcher import GpxMatchResult, match_chunk
 from app.map_matching_dialog import MapMatchingDialog
 from app.map_matching_worker import MapMatchingWorker
 from app.map_widget import MapWidget
+from app.mapillary_upload_dialog import MapillaryUploadDialog
+from app.mapillary_upload_worker import MapillaryUploadWorker
 from app.mapillary_validation_dialog import MapillaryValidationDialog
 from app.mapillary_validation_worker import MapillaryValidationWorker
-from app.mapillary_validator import ValidationResult, is_mapillary_tools_available
+from app.mapillary_validator import (
+    UploadResult,
+    ValidationResult,
+    is_mapillary_tools_available,
+)
 from app.offset_widget import OffsetWidget
 from app.state import AppState
 from app.time_utils import playback_ms_to_real_ms
@@ -43,7 +51,11 @@ from app.video_widget import VideoWidget, format_time
 
 GPX_FILE_FILTER = "GPX Files (*.gpx)"
 VIDEO_FILE_FILTER = "Video Files (*.mp4 *.mov *.avi *.mkv *.m4v);;All Files (*)"
-REVERSE_TICK_MS = 40
+REVERSE_INITIAL_STEP_MS = 40
+
+SETTINGS_ORG = "gpx_vsync"
+SETTINGS_APP = "VideoGpxSyncTool"
+MAPILLARY_USERNAME_SETTINGS_KEY = "mapillary/user_name"
 
 
 class MainWindow(QMainWindow):
@@ -52,6 +64,7 @@ class MainWindow(QMainWindow):
         match_chunk_impl: Callable[[list[tuple[float, float]]], dict] = match_chunk,
         is_mapillary_tools_available_impl: Callable[[], bool] = is_mapillary_tools_available,
         validate_export_impl: Callable[..., ValidationResult | None] | None = None,
+        upload_export_impl: Callable[..., UploadResult | None] | None = None,
     ) -> None:
         super().__init__()
         self.state = AppState()
@@ -61,10 +74,10 @@ class MainWindow(QMainWindow):
         self._match_chunk_impl = match_chunk_impl
         self._is_mapillary_tools_available_impl = is_mapillary_tools_available_impl
         self._validate_export_impl = validate_export_impl
+        self._upload_export_impl = upload_export_impl
         self._video_fps: float | None = None
-        self._reverse_timer = QTimer(self)
-        self._reverse_timer.setInterval(REVERSE_TICK_MS)
-        self._reverse_timer.timeout.connect(self._on_reverse_tick)
+        self._reverse_active = False
+        self._reverse_last_step_time: float | None = None
 
         self.setWindowTitle(f"Video-GPX Sync Tool v{APP_VERSION}")
         self.resize(1280, 720)
@@ -137,7 +150,7 @@ class MainWindow(QMainWindow):
 
         transport_layout = QHBoxLayout()
         transport_layout.setSpacing(8)
-        self.reverse_button = QPushButton("⏪ 逆再生")
+        self.reverse_button = QPushButton("◀ 逆再生")
         self.step_back_button = QPushButton("⏮ コマ戻り")
         self.pause_button = QPushButton("⏸ 一時停止")
         self.step_forward_button = QPushButton("⏭ コマ送り")
@@ -180,6 +193,51 @@ class MainWindow(QMainWindow):
         self.open_video_action.triggered.connect(self.open_video_dialog)
         menu.addAction(self.open_video_action)
 
+        menu.addSeparator()
+
+        self.mapillary_username_action = QAction("Mapillaryユーザー名...", self)
+        self.mapillary_username_action.triggered.connect(
+            self.on_edit_mapillary_username_clicked
+        )
+        menu.addAction(self.mapillary_username_action)
+
+    @staticmethod
+    def _mapillary_settings() -> QSettings:
+        # IniFormatを明示することで、QSettings.setPath()によるテスト時の
+        # 保存先リダイレクトが効くようにする（macOSのNativeFormat＝plistは
+        # setPath()の対象外で、素の QSettings(org, app) だと常に実際の
+        # ~/Library/Preferences/ を読み書きしてしまいテストを汚染する）。
+        return QSettings(
+            QSettings.Format.IniFormat,
+            QSettings.Scope.UserScope,
+            SETTINGS_ORG,
+            SETTINGS_APP,
+        )
+
+    def _get_mapillary_user_name(self) -> str:
+        """事前に`mapillary_tools authenticate`で認証済みのユーザー名
+        （--user_name用）。QSettingsでOS標準の設定ストレージに保存され、
+        アプリを再起動しても保持される（24章）。"""
+        return self._mapillary_settings().value(
+            MAPILLARY_USERNAME_SETTINGS_KEY, "", type=str
+        )
+
+    def _set_mapillary_user_name(self, value: str) -> None:
+        self._mapillary_settings().setValue(MAPILLARY_USERNAME_SETTINGS_KEY, value)
+
+    def on_edit_mapillary_username_clicked(self) -> None:
+        current = self._get_mapillary_user_name()
+        text, ok = QInputDialog.getText(
+            self,
+            "Mapillaryユーザー名",
+            "mapillary_tools authenticateで認証済みのユーザー名を"
+            "入力してください（空欄にすると--user_name指定なしに戻ります）:",
+            text=current,
+        )
+        if not ok:
+            return
+        self._set_mapillary_user_name(text.strip())
+
     def _wire_signals(self) -> None:
         self.open_gpx_button.clicked.connect(self.open_gpx_dialog)
         self.open_video_button.clicked.connect(self.open_video_dialog)
@@ -193,6 +251,7 @@ class MainWindow(QMainWindow):
 
         self.video_widget.position_changed.connect(self.on_position_changed)
         self.video_widget.duration_changed.connect(self.on_duration_changed)
+        self.video_widget.seek_settled.connect(self._on_seek_settled)
         self.video_widget.timeline.start_changed.connect(self.on_start_changed)
         self.video_widget.timeline.end_changed.connect(self.on_end_changed)
 
@@ -276,6 +335,17 @@ class MainWindow(QMainWindow):
         self._update_open_button_emphasis()
         self._update_route_range_highlight()
 
+        # GPSデータソースが切り替わった以上、直前のセッションで調整した
+        # オフセットは新しいデータに対してはもはや正しくない（2026-07-18
+        # 実機で発生した不具合の修正）。特に、本ツール自身がExportした
+        # 「synced」動画は埋め込みGPSに既にオフセット適用済みの実時刻が
+        # 焼き込まれているため、そのまま古いオフセットが生き残ると
+        # 二重にオフセットがかかり同期がズレる。offset_widget.reset()は
+        # 内部状態のリセットに加えoffset_changedシグナルを発行するため、
+        # state.offset_seconds・マップの現在地マーカー・出力ボタンの
+        # 有効状態・ルート塗り分けも連動して更新される。
+        self.offset_widget.reset()
+
     def _run_map_matching(self, points) -> GpxMatchResult:
         """GPX読み込み時のマップマッチング（5-9節）。ワーカーをバックグラウンド
         実行しつつ進捗ダイアログをモーダル表示し、完了まで待つ。"""
@@ -350,7 +420,7 @@ class MainWindow(QMainWindow):
         )
 
     def load_video(self, path: str) -> None:
-        self._stop_reverse_timer()
+        self._stop_reverse()
 
         try:
             creation_time_str = self.video_handler.get_creation_time(path)
@@ -555,25 +625,32 @@ class MainWindow(QMainWindow):
     def _update_video_info_label(self, interval_sec: float) -> None:
         """動画の素性（fps・タイムラプス設定）を右カードのヘッダー直下に
         表示する（17章）。左カードのmap_matching_status_labelと同じ
-        位置に配置することで、左右カードの上下位置を揃えている。"""
+        位置に配置することで、左右カードの上下位置を揃えている。
+        文字色も左カードと同じstateプロパティ方式で統一する
+        （2026-07-18、既定の黒文字だったのをアクセントカラーに変更）。"""
         if self.state.video_path is None:
             self.video_info_label.setVisible(False)
             return
 
         if self._video_fps is None:
             text = "fps不明"
+            state = "warn"
         else:
             text = f"{self._video_fps:.2f}fps"
             if self.state.video_time_scale != 1.0:
                 text += f"（{interval_sec:g}sタイムラプス）"
+            state = "ok"
 
         self.video_info_label.setText(text)
+        self.video_info_label.setProperty("state", state)
+        self.video_info_label.style().unpolish(self.video_info_label)
+        self.video_info_label.style().polish(self.video_info_label)
         self.video_info_label.setVisible(True)
 
     def _current_playback_rate(self) -> float:
         """タイムラプス設定を反映した順再生の速度倍率。_apply_playback_rate()
-        （QMediaPlayer.setPlaybackRate()向け）と_on_reverse_tick()
-        （疑似逆再生の1ティックあたりの移動量計算向け）で共通利用する。"""
+        （QMediaPlayer.setPlaybackRate()向け）と_reverse_step()
+        （疑似逆再生の1ステップあたりの移動量計算向け）で共通利用する。"""
         if self.state.video_time_scale == 1.0:
             return 1.0
         return 1.0 / self.state.video_time_scale
@@ -651,33 +728,57 @@ class MainWindow(QMainWindow):
         self.offset_widget.set_offset(offset_sec)
 
     def on_play_clicked(self) -> None:
-        self._stop_reverse_timer()
+        self._stop_reverse()
         self.video_widget.play()
 
     def on_pause_clicked(self) -> None:
-        self._stop_reverse_timer()
+        self._stop_reverse()
         self.video_widget.pause()
 
     def on_reverse_clicked(self) -> None:
         """逆再生（18章）。QMediaPlayer.setPlaybackRate()は負値を受け付けず
         実機で0倍速に丸められてしまう（実機検証済み）ため、ネイティブな
-        逆再生機能は使わず、タイマーで再生位置を少しずつ巻き戻すことで
-        疑似的に実現する。"""
+        逆再生機能は使わず、再生位置を少しずつ巻き戻すことで疑似的に
+        実現する。ただし固定間隔で連投すると、どのシークも映像フレームの
+        描画が完了しないまま次のシークに上書きされ続けてしまう
+        （2026-07-18実機検証で判明。シークバーのドラッグ操作でも同様の
+        現象を確認）。そのため、直前のシークの描画完了
+        （video_widget.seek_settled）を待ってから次のステップへ進む。"""
         self.video_widget.pause()
-        self._reverse_timer.start()
+        self._reverse_active = True
+        # 初回は比較対象の実測値がないため、REVERSE_INITIAL_STEP_MS分
+        # 前の時刻を基準にする（1ステップ目だけ旧来の固定値相当になる）
+        self._reverse_last_step_time = time.monotonic() - REVERSE_INITIAL_STEP_MS / 1000.0
+        self._reverse_step()
 
-    def _stop_reverse_timer(self) -> None:
-        self._reverse_timer.stop()
+    def _stop_reverse(self) -> None:
+        self._reverse_active = False
 
-    def _on_reverse_tick(self) -> None:
-        step_ms = round(REVERSE_TICK_MS * self._current_playback_rate())
+    def _on_seek_settled(self) -> None:
+        if self._reverse_active:
+            self._reverse_step()
+
+    def _reverse_step(self) -> None:
+        """1ステップで戻す量は、キーフレームからのデコードし直しに
+        かかる実際の所要時間に応じて動的に決める。GOP（キーフレーム
+        間隔）に対して戻す距離が小さすぎると、ほぼ同じ区間を毎回
+        デコードし直すだけで進む距離がごくわずか、という非効率な
+        状態になり「2〜3秒に1コマしか進まない」不具合につながって
+        いた（2026-07-18実機検証で判明）。直前のステップに実際に
+        かかった時間を測り、それに比例した距離だけ戻すことで、
+        遅ければ遅いなりに大きく戻るようになり、スクラブ操作と同様に
+        実時間に見合った速度に収束する。"""
+        now = time.monotonic()
+        elapsed_ms = (now - self._reverse_last_step_time) * 1000.0
+        self._reverse_last_step_time = now
+        step_ms = max(round(elapsed_ms * self._current_playback_rate()), 1)
         start_ms = self.video_widget.timeline.start_ms()
         new_pos = self.video_widget.player.position() - step_ms
         if new_pos <= start_ms:
-            self.video_widget.player.setPosition(start_ms)
-            self._stop_reverse_timer()
+            self._stop_reverse()
+            self.video_widget.seek(start_ms)
         else:
-            self.video_widget.player.setPosition(new_pos)
+            self.video_widget.seek(new_pos)
 
     def on_step_back_clicked(self) -> None:
         self._step_frame(-1)
@@ -691,7 +792,7 @@ class MainWindow(QMainWindow):
         動画ファイル上の1フレーム分移動する）。"""
         if self._video_fps is None or self._video_fps <= 0:
             return
-        self._stop_reverse_timer()
+        self._stop_reverse()
         self.video_widget.pause()
         frame_ms = round(1000 / self._video_fps)
         self.video_widget.seek(self.video_widget.player.position() + direction * frame_ms)
@@ -769,27 +870,65 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "出力エラー", str(exc))
             return
 
+        user_name = self._get_mapillary_user_name() or None
         command = self.exporter.build_mapillary_tools_command(
-            self.state, video_path, gpx_path
+            self.state, video_path, gpx_path, user_name=user_name
         )
-        validation_message = self._validate_export_and_format_message(video_path)
 
-        QMessageBox.information(
-            self,
-            "出力完了",
+        if self._is_mapillary_tools_available_impl():
+            validation_result = self._run_local_validation(video_path)
+            validation_message = self._format_validation_message(validation_result)
+        else:
+            validation_result = None
+            validation_message = (
+                "ローカル検証: mapillary_toolsが見つからないためスキップされました"
+            )
+        # Uploadボタンはローカル検証がOKだった場合のみ有効化する（24章）。
+        # 検証が失敗している時点でアップロードもほぼ確実に同じ理由で
+        # 失敗するため、無駄なアップロード試行を避ける。
+        can_upload = validation_result is not None and validation_result.ok
+
+        self._show_export_complete_dialog(
+            video_path, gpx_path, command, validation_message, can_upload
+        )
+
+    def _show_export_complete_dialog(
+        self,
+        video_path: str,
+        gpx_path: str,
+        command: str,
+        validation_message: str,
+        can_upload: bool,
+    ) -> None:
+        """出力完了ダイアログ（24章）。「Mapillaryへアップロード」ボタンを
+        追加したため、標準のQMessageBox.information()ではなくインスタンスを
+        直接構築してカスタムボタン（ActionRole）を追加する。"""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("出力完了")
+        box.setText(
             f"出力が完了しました。\n\n"
             f"動画: {video_path}\nGPX: {gpx_path}\n\n"
             f"{validation_message}\n\n"
-            f"Mapillaryへアップロードするには"
-            f"以下のコマンドを実行してください:\n\n{command}",
+            f"Mapillaryへアップロードするには、下の「Mapillaryへ"
+            f"アップロード」ボタンを押すか、以下のコマンドを"
+            f"手動で実行してください:\n\n{command}"
         )
+        box.addButton(QMessageBox.StandardButton.Ok)
+        upload_button = box.addButton(
+            "Mapillaryへアップロード", QMessageBox.ButtonRole.ActionRole
+        )
+        upload_button.setEnabled(can_upload)
 
-    def _validate_export_and_format_message(self, video_path: str) -> str:
-        """出力後ローカル検証（5-10節）。mapillary_toolsが利用可能な場合のみ、
-        バックグラウンドでvideo_processを実行し、結果メッセージを返す。"""
-        if not self._is_mapillary_tools_available_impl():
-            return "ローカル検証: mapillary_toolsが見つからないためスキップされました"
+        box.exec()
+        if box.clickedButton() is upload_button:
+            self._start_mapillary_upload(video_path)
 
+    def _run_local_validation(self, video_path: str) -> ValidationResult | None:
+        """出力後ローカル検証（5-10節）。呼び出し前提として
+        is_mapillary_tools_available_impl()がTrueであること
+        （呼び出し元のon_export_clicked()側で判定済み）。バックグラウンドで
+        video_processを実行し、結果を返す。"""
         video_start_time = self.exporter.get_video_start_time_str(self.state)
 
         worker_kwargs = {}
@@ -807,7 +946,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
         worker.wait()
 
-        return self._format_validation_message(result_holder.get("result"))
+        return result_holder.get("result")
 
     @staticmethod
     def _format_validation_message(result: ValidationResult | None) -> str:
@@ -821,9 +960,65 @@ class MainWindow(QMainWindow):
             message += f"\n警告 {len(result.warnings)}件"
         return message
 
+    def _start_mapillary_upload(self, video_path: str) -> None:
+        """Mapillaryへの実アップロード（24章）。外部サービスへの公開的な
+        アップロードという不可逆かつ他者に影響する操作のため、実行前に
+        確認ダイアログを挟む（デフォルトボタンはCancel）。"""
+        reply = QMessageBox.question(
+            self,
+            "Mapillaryへアップロード",
+            "Mapillaryへアップロードします。アップロードした画像は"
+            "Mapillary上で公開されます。よろしいですか？\n\n"
+            "（キャンセルしても、mapillary_tools側で中断した時点までの"
+            "アップロードは保持され、次回再開できます）",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Ok:
+            return
+
+        video_start_time = self.exporter.get_video_start_time_str(self.state)
+        user_name = self._get_mapillary_user_name() or None
+
+        worker_kwargs = {}
+        if self._upload_export_impl is not None:
+            worker_kwargs["upload_export_impl"] = self._upload_export_impl
+        worker = MapillaryUploadWorker(
+            video_path, video_start_time, user_name=user_name, **worker_kwargs
+        )
+        dialog = MapillaryUploadDialog(worker, self)
+
+        result_holder: dict = {}
+        worker.finished_upload.connect(
+            lambda result: result_holder.update(result=result)
+        )
+
+        worker.start()
+        dialog.exec()
+        worker.wait()
+
+        self._show_upload_result(result_holder.get("result"))
+
+    def _show_upload_result(self, result: UploadResult | None) -> None:
+        if result is None:
+            QMessageBox.information(
+                self, "アップロード", "アップロードをキャンセルしました。"
+            )
+            return
+        if result.ok:
+            message = "Mapillaryへのアップロードが完了しました。"
+            if result.warnings:
+                message += f"\n警告 {len(result.warnings)}件"
+            QMessageBox.information(self, "アップロード完了", message)
+        else:
+            message = "Mapillaryへのアップロードに失敗しました。\n" + "\n".join(
+                result.errors
+            )
+            QMessageBox.warning(self, "アップロードエラー", message)
+
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 - Qtの命名規則に合わせる
-        self._stop_reverse_timer()
+        self._stop_reverse()
         self.video_widget.player.stop()
         self.video_widget.player.setSource(QUrl())
         super().closeEvent(event)

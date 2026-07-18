@@ -7,7 +7,11 @@ import pytest
 from app.camm_encoder import embed_gps_track
 from app.exporter import format_video_start_time
 from app.gpx_handler import GPXHandler
-from app.mapillary_validator import is_mapillary_tools_available, validate_export
+from app.mapillary_validator import (
+    is_mapillary_tools_available,
+    upload_export,
+    validate_export,
+)
 
 MAPILLARY_TOOLS_AVAILABLE = shutil.which("mapillary_tools") is not None
 MP4BOX_AVAILABLE = shutil.which("MP4Box") is not None
@@ -110,3 +114,43 @@ def test_validate_export_succeeds_for_timelapse_video(tmp_path) -> None:
     assert result is not None
     assert result.ok is True
     assert result.n_images > 0
+
+
+def test_upload_export_succeeds_with_camm_embedded_video(embedded_video: str) -> None:
+    """dry_run=Trueにより実際にはMapillaryへ送信せず、ローカルの一時
+    ディレクトリへのシミュレーションに留める（24章、実ネットワーク送信は
+    自動テストでは行わない）。"""
+    result = upload_export(embedded_video, "2026_07_12_01_00_00_000", dry_run=True)
+    assert result is not None
+    assert result.ok is True
+
+
+def test_upload_export_fails_without_gps() -> None:
+    result = upload_export(SAMPLE_MP4, "2026_07_12_01_00_00_000", dry_run=True)
+    assert result is not None
+    assert result.ok is False
+    assert len(result.errors) > 0
+
+
+def test_upload_export_cancel_returns_none(embedded_video: str) -> None:
+    result = upload_export(
+        embedded_video,
+        "2026_07_12_01_00_00_000",
+        dry_run=True,
+        should_cancel=lambda: True,
+    )
+    assert result is None
+
+
+def test_upload_export_passes_user_name_through(embedded_video: str) -> None:
+    """--user_nameが実際にmapillary_toolsへ渡っていることを、存在しない
+    プロファイル名を指定した際のエラーメッセージから確認する。"""
+    result = upload_export(
+        embedded_video,
+        "2026_07_12_01_00_00_000",
+        user_name="nonexistent_test_user_zzz",
+        dry_run=True,
+    )
+    assert result is not None
+    assert result.ok is False
+    assert any("nonexistent_test_user_zzz" in line for line in result.errors)

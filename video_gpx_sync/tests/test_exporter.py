@@ -148,8 +148,19 @@ def test_build_mapillary_tools_command(
     assert "--geotag_source_path" not in cmd
     assert "--video_sample_distance 3" in cmd
     assert "--video_sample_interval -1" in cmd
+    assert "--filetypes image" in cmd
     # video_start_ms=1000 なので creation_time(01:00:00) + 1s = 01:00:01
     assert "--video_start_time 2026_07_12_01_00_01_000" in cmd
+    assert "--user_name" not in cmd
+
+
+def test_build_mapillary_tools_command_includes_user_name_when_given(
+    exporter: Exporter, base_state: AppState
+) -> None:
+    cmd = exporter.build_mapillary_tools_command(
+        base_state, "out.mp4", "out.gpx", user_name="alice"
+    )
+    assert "--user_name alice" in cmd
 
 
 def test_get_video_start_time_str_applies_time_scale(

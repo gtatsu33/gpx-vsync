@@ -147,6 +147,15 @@ class VideoHandler:
         end_ms: int,
         video_creation_time: datetime.datetime | None = None,
     ) -> None:
+        """出力はmapillary_tools向けであり音声は不要なため、
+        _reencode_segment()/_copy_segment_by_frames()いずれも-anで
+        音声トラックを出力に含めない（2026-07-18追加）。副次効果として、
+        音声トラックのフレーム境界非整合により映像より僅かに長い
+        音声だけが残り、コンテナ全体の長さ（ffprobeのformat.duration）
+        が映像・GPSデータの実長より長くなる不具合も併せて解消される
+        （実機で発生。動画のStart〜End全区間がGPSでカバーされている
+        にもかかわらず、再読み込み時に末尾わずかがクロップ対象と
+        誤検出される原因だった）。"""
         start_sec = start_ms / 1000
         end_sec = end_ms / 1000
 
@@ -286,8 +295,7 @@ class VideoHandler:
             "fast",
             "-crf",
             "18",
-            "-c:a",
-            "aac",
+            "-an",
         ]
         command.extend(self._metadata_args(creation_time))
         command.append(output_path)
@@ -311,6 +319,7 @@ class VideoHandler:
                 str(frame_count),
                 "-c",
                 "copy",
+                "-an",
                 output_path,
             ],
             capture_output=True,

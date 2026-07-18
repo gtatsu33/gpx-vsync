@@ -222,10 +222,48 @@
       _update_export_button_state()
       _update_open_button_emphasis()
       _update_route_range_highlight()
+      self.offset_widget.reset()  # 2026-07-18追加、下記
     注: マップマッチング結果の反映（_update_map_matching_status()）
     と動画埋め込みGPS採用の反映（_update_gps_source_status_for_camm()）
     はこのメソッドの外（呼び出し元）で行う。ステータス表示の文言が
     データの出所によって異なるため（5-9節・5-12節）。
+
+    offset_widget.reset()を追加した経緯（2026-07-18、実機で発生した
+    不具合の修正）:
+    ユーザーより「GPXと動画を別々に読み込み同期を取ってExportした後、
+    そのExport済みsynced動画を同一アプリ起動中に読み込み直すと同期が
+    ズレる。アプリを再起動してから読み込めば正しく再生される」との
+    報告を受けた。実際にtests/test_main_window.pyと同じ手順
+    （load_gpx→load_video→on_offset_changed(2.0)→export→同一
+    MainWindowインスタンスでload_video(synced_path)）で再現した結果、
+    再読み込み後もstate.offset_secondsが直前の値（2.0）のまま
+    リセットされておらず、gpx_handler.interpolate_position()に
+    渡ると誤った座標になることを確認した。
+    原因: Export済みの動画に埋め込まれたGPS（CAMM）は、Export時点で
+    既にstate.offset_secondsを適用した後の実時刻が焼き込まれている。
+    ところが_apply_gps_source()（_try_load_embedded_gps()経由で
+    このExport済み動画自身から新しいgpx_handlerを構築する際にも
+    呼ばれる）は、gpx_handler・gpx_path・gpx_dataを差し替えるだけで
+    state.offset_secondsには一切触れていなかったため、既に
+    オフセット適用済みのGPSデータに対して、古いセッションの
+    オフセット値がそのまま二重に上書き適用されてしまっていた。
+    AppState()は新規作成時offset_seconds=0.0がデフォルトのため、
+    アプリを再起動すれば0から再開され問題が起きない、という点も
+    実機報告と整合した。
+    対処として、_apply_gps_source()の最後でoffset_widget.reset()を
+    呼ぶようにした。GPSデータソース自体が切り替わった以上、直前の
+    セッションで調整したオフセットは新しいデータに対してはもはや
+    正しくない（特にExport済み動画の自己embedded GPSに対しては
+    常に0が正しい）という考え方に基づく。OffsetWidget.reset()は
+    内部状態を0にした上でoffset_changedシグナルを発行するため、
+    on_offset_changed()経由でstate.offset_seconds・マップの現在地
+    マーカー・出力ボタンの有効状態・ルート塗り分けも連動して更新
+    される（新たな配線を追加する必要がなかった）。
+    回帰テスト:
+    test_reloading_own_exported_synced_video_resets_stale_offset
+    （tests/test_main_window.py）で、offset=2.0でExportした動画を
+    同一セッション内で読み込み直した後、state.offset_secondsが0.0に
+    戻ること、および位置補間結果が正しい座標になることを確認した。
   - load_video(path)（タイムラプス対応統合後のフロー。15章・4-15節・
     4-16節・23章）:
       1. get_creation_time() / get_duration_ms() 取得、
@@ -477,7 +515,11 @@
       seek_requested を発火する（スクラブ操作。2026-07-13追加。
       以前は押した瞬間の1回しかシークされず、ドラッグに追従
       しなかった。ユーザーから「シークバーがドラッグできないのは
-      致命的」というフィードバックを受けて対応した）
+      致命的」というフィードバックを受けて対応した）。なお
+      CustomTimeline自体はmouseMoveEventのたびに無条件で
+      seek_requested を発火するが、これを受け取るVideoWidget.seek()
+      側で2026-07-18に描画完了待ちのペーシングを追加したため、
+      高速ドラッグ時は中間の位置が間引かれる（19章参照）
   - Start/End の制約:
       Start < End（MIN_GAP_MS=100ms以上の間隔を維持。_clamp_start()/
       _clamp_end()。set_start()/set_end()経由のプログラム的な設定
@@ -704,7 +746,7 @@
                "ffmpeg", "-ss", str(start_ms/1000), "-to", str(kf_start),
                "-i", input_path,
                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-               "-c:a", "aac",
+               "-an",
                tmp_part_a
            ])
       6. 区間B（ストリームコピー）: kf_start 〜 kf_end
@@ -721,6 +763,7 @@
                "-i", input_path,
                "-frames:v", str(frame_count),
                "-c", "copy",
+               "-an",
                tmp_part_b
            ])
       7. 区間C（再エンコード）: kf_end 〜 end_ms
@@ -728,7 +771,7 @@
                "ffmpeg", "-ss", str(kf_end), "-to", str(end_ms/1000),
                "-i", input_path,
                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-               "-c:a", "aac",
+               "-an",
                tmp_part_c
            ])
       8. concat demuxer で区間A+B+Cを結合:
@@ -746,10 +789,32 @@
       （境界がキーフレームに一致する場合）はスキップして
       concatの対象から除外する。
 
-      音声について: 各区間の再エンコード境界でAACエンコーダの
-      priming/padding sampleにより、コンテナ全体の再生時間が
-      数十ミリ秒（実測23ms程度）ずれる場合があるが、映像フレーム数は
-      正確に一致するため実用上問題ない。
+      音声について（2026-07-18改訂。当初は「実害なし」と判断していたが
+      誤りだったことが判明）:
+      当初は各区間の再エンコード境界でAACエンコーダのpriming/padding
+      sampleにより、コンテナ全体の再生時間が数十ミリ秒（実測23ms程度）
+      ずれる場合があるが、映像フレーム数は正確に一致するため実用上
+      問題ないと判断していた。しかし2026-07-18、ユーザー自身が過去に
+      本ツールでExportした動画（タイムラプス設定、実測で音声トラック
+      のみ映像トラックより約53ms長い）を読み込んで再度Exportしようと
+      した際、GPS未カバー区間として誤って検出され「動画をクロップ
+      します」という警告が出る不具合として顕在化した。原因は、
+      VideoHandler.get_duration_ms()が読むコンテナ全体の長さ
+      （ffprobeのformat.duration）が、複数トラックのうち最長の
+      トラック（音声）に引きずられて決まるため、動画タイムラインの
+      Endが実際の映像・GPSデータの終端より音声の分だけ長く表示されて
+      しまい、5-10節の判定ロジックがその差分をGPS未カバーと誤認する
+      ことだった。
+      根本的に、mapillary_tools向けのMapillary投稿用途では音声は
+      不要であるため、そもそも出力に音声を含めない方針に変更した
+      （_reencode_segment()・_copy_segment_by_frames()いずれも
+      -c:a aac / -c copy(音声含む)を-anに変更し、音声トラック自体を
+      出力しないようにした）。これにより長さのズレが発生する余地が
+      なくなり、副次的に上記の誤クロップ検出も解消される。
+      mapillary_tools（0.14.7）が音声なしのCAMM埋め込み動画を問題なく
+      処理できることは実機で確認済み（tests/test_mapillary_validator.py
+      と同じ手法で、音声を除去したテスト動画に対しvalidate_export()を
+      実行し、画像件数・エラー無しを確認）。
 
       重要（Step 8のmapillary_tools連携検証で判明した問題と対処）:
       Smart Cutで生成したconcat出力には、元動画が持っていた
@@ -1144,7 +1209,11 @@
              --video_start_time <video_start_time>
              --video_sample_distance 3
              --video_sample_interval -1
+             --filetypes image
              --desc_path <desc_path>
+       --filetypes imageは24章で追加（2026-07-18。mapillary_tools自身が
+       「無いと動画サンプルと動画ファイル自体の両方を処理・アップロード
+       してしまう可能性がある」と警告するため付与）
        短い間隔でプロセスの生死をポーリングしつつ should_cancel() を
        確認し、Trueならprocess.terminate()した上で
        ValidationResult(ok=False, n_images=0, errors=[],
@@ -1362,7 +1431,7 @@
           │           ├── QVideoWidget       ← stretch: 1
           │           ├── CustomTimeline     ← fixed height ~80px
           │           └── QHBoxLayout (transport_layout、間隔8px。19章)
-          │               ├── QPushButton("⏪ 逆再生", reverse_button)
+          │               ├── QPushButton("◀ 逆再生", reverse_button)
           │               ├── QPushButton("⏮ コマ戻り", step_back_button)
           │               ├── QPushButton("⏸ 一時停止", pause_button)
           │               ├── QPushButton("⏭ コマ送り", step_forward_button)
@@ -1509,7 +1578,15 @@
         --geotag_source exif \
         --video_start_time <YYYY_MM_DD_HH_MM_SS_sss> \
         --video_sample_distance 3 \
-        --video_sample_interval -1
+        --video_sample_interval -1 \
+        --filetypes image
+
+  --filetypes imageは24章で追加（2026-07-18）。付けないと
+  mapillary_tools自身が「動画のサンプル画像と動画ファイル自体の両方を
+  処理・アップロードしてしまう可能性がある」と警告する（実機検証では
+  単一動画ファイルを渡す本ツールの使い方で実害は確認できなかったが、
+  --filetypes imageを付けても結果が変わらず警告のみ消えることを
+  確認済みのため、mapillary_tools自身の推奨に従い付与する）。
 
   --geotag_source を採用した経緯（GPX直接参照方式からの変更）:
     当初は --geotag_source gpx + --geotag_source_path <出力GPX> という
@@ -2055,10 +2132,15 @@
       揃っている前提のもと、上下位置が自然に一致する
     - _update_video_info_label(interval_sec: float):
         state.video_path is None: 非表示
-        self._video_fps is None: "fps不明"
-        それ以外: f"{fps:.2f}fps"
+        self._video_fps is None: "fps不明"、state="warn"
+        それ以外: f"{fps:.2f}fps"、state="ok"
                   state.video_time_scale != 1.0 の場合は
                   f"（{interval_sec:g}sタイムラプス）" を追記
+      文字色はmap_matching_status_labelと同じstateプロパティ方式
+      （setProperty("state", ...) + style().unpolish()/polish()、
+      17章のQLabel[state="ok"/"warn"/"error"]スタイル）を流用する
+      （2026-07-18追加。当初はstateを設定しておらず既定の黒文字
+      だった）
     - on_timelapse_changed()（15章）の末尾から呼ぶことで、
       load_video()内のtimelapse_widget.reset()や
       _prompt_timelapse_settings()由来のsetChecked/setValue、
@@ -2078,33 +2160,119 @@
     コマ送り・再生の5ボタンにしてほしい。コマ送り・コマ戻りは1フレーム
     単位で」との要望を受けた。
 
-  逆再生の実現方式（実機検証済み、2026-07-15）:
+  逆再生の実現方式（実機検証済み、2026-07-15。2026-07-18に不具合修正で
+  ペーシング方式へ変更）:
     QMediaPlayer.setPlaybackRate()に負値（例: -1.0）を設定しても
     エラーにはならないが、実際にはplaybackRate()の値が黙って0.0に
     丸められることをQt6.11のFFmpegベースマルチメディアバックエンド
     （macOS、offscreen環境）で確認した。すなわちこのバックエンドは
-    ネイティブな逆再生に対応していない。
-    代替として、QTimer（REVERSE_TICK_MS=40ms間隔）でplayer.position()
-    を少しずつ減算していく疑似逆再生方式を採用した。同種の手法
-    （setPositionを短い間隔で30回連続呼び出し）を実機で検証し、
-    クラッシュせず位置が単調に減少することを確認済み。
-    - on_reverse_clicked(): video_widget.pause()の上で
-      self._reverse_timer.start()（interval=REVERSE_TICK_MS、
-      __init__でQTimer(self)として生成しtimeout→_on_reverse_tick()
-      に接続済み）
-    - _on_reverse_tick():
-        step_ms = round(REVERSE_TICK_MS * _current_playback_rate())
-        new_pos = player.position() - step_ms
-        new_pos <= timeline.start_ms() の場合:
-          player.setPosition(timeline.start_ms())
-          タイマー停止
-        それ以外: player.setPosition(new_pos)
-      _current_playback_rate()を使うことで、タイムラプス設定有効時の
-      順再生と同じ体感速度で巻き戻る（4-1節参照）
-    - _stop_reverse_timer(): self._reverse_timer.stop()。
-      on_play_clicked() / on_pause_clicked() / _step_frame() /
-      load_video() / closeEvent() の冒頭で呼び、逆再生と他の操作が
-      同時に走らないようにする
+    ネイティブな逆再生に対応していない。Qt6公式ドキュメント
+    （QMediaPlayer.playbackRate）でも"Negative playback rates are not
+    supported."と明記されている（2026-07-18確認）。
+    代替として、player.position()を少しずつ減算していく疑似逆再生方式を
+    採用しているが、その実装は2段階の変遷を経ている。
+
+    [初版 2026-07-15、不具合あり]
+    QTimer（REVERSE_TICK_MS=40ms間隔）でsetPosition()を無条件に連投
+    する方式。setPositionを短い間隔で連続呼び出ししてもクラッシュせず
+    position()の値が単調に減少することは実機検証済みだったが、
+    「position()の値（＝マップのマーカー位置）は更新されるのに、
+    映像フレームは1枚も描画されないまま真っ黒・またはフリーズして
+    見える」という不具合が2026-07-18の実機検証で発覚した。原因は、
+    Qt6のマルチメディアバックエンド（FFmpeg/AVFoundation、Qt公式
+    フォーラムで同様の報告多数）が、一時停止中に短い間隔で連投された
+    setPosition()のどれも描画完了まで処理しきれず、次のシークに
+    上書きされ続けてしまうことだった。シークバーをドラッグしての
+    スクラブ操作でも、ドラッグ中は映像が固まり指を離した瞬間に描画
+    される、という同一原因の不具合が確認された。
+    なお、この際に暫定対処として毎ティックplayer.play()→pause()を
+    挟む方式を試したが、状態遷移が余計に増えることでかえって描画が
+    完全に止まる（常に真っ黒）症状に悪化したため撤回した。
+
+    [現行版 2026-07-18]
+    根本原因（連投されたシークが描画完了を待たずに上書きされ続ける）
+    に対処するため、VideoWidget内に「直前のシークの映像フレーム描画が
+    実際に完了するまで、次のシークを発行しない」ペーシングの仕組みを
+    導入した（app/video_widget.py）。この仕組みは逆再生専用ではなく、
+    video_widget.seek()（シークバーのドラッグ・コマ送り/戻りが使用）と
+    VideoWidget._on_start_changed()/_on_end_changed()
+    （Start/Endハンドルドラッグ時の現在地クランプ）からも共通で
+    使われる、根本原因を共有する3箇所すべてに対する修正である。
+
+    - VideoWidget.seek_settled（新設シグナル、引数なし）:
+      直前のシーク要求について、実際に映像フレームの描画が完了した
+      （またはSEEK_FRAME_TIMEOUT_MS=400ms待っても完了しなかった
+      ためタイムアウトで打ち切った）ことを通知する
+    - VideoWidget._request_seek(ms): 公開の seek() や
+      _on_start_changed()/_on_end_changed() から呼ばれる内部エントリ
+      ポイント。既に処理中のシークがあれば、新しい目標位置で
+      self._pending_seek_ms を上書きするだけに留め、setPosition()は
+      呼ばない（＝連投せず、間の目標は間引かれる。最後に要求した
+      位置には必ず収束する）
+    - VideoWidget._start_next_paced_seek(): self._pending_seek_ms を
+      対象にplayer.setPosition()を実行し、self._seek_in_flight=True、
+      SEEK_FRAME_TIMEOUT_MSのタイムアウトタイマーを開始する
+    - VideoWidget._on_seek_frame_ready(): player.videoSink().
+      videoFrameChanged（Qt6公式API。setVideoOutput()呼び出し後は
+      videoSink()が有効な値を返すことを実機・ヘッドレス環境で確認済み）
+      またはタイムアウトタイマーのtimeoutに接続。処理中でなければ
+      無視（通常再生中の毎フレームのvideoFrameChangedと衝突しない
+      ためのガード）。保留中の目標があれば
+      _start_next_paced_seek()で次のシークへ進み、なければ
+      seek_settled を発行する
+    - main_window.py側の逆再生ロジック:
+        on_reverse_clicked(): video_widget.pause()の上で
+          self._reverse_active = True にし、
+          self._reverse_last_step_time = time.monotonic() -
+          REVERSE_INITIAL_STEP_MS/1000.0 で基準時刻を初期化してから
+          _reverse_step() を呼ぶ
+        _reverse_step():
+          now = time.monotonic()
+          elapsed_ms = (now - self._reverse_last_step_time) * 1000.0
+          self._reverse_last_step_time = now
+          step_ms = max(round(elapsed_ms * _current_playback_rate()), 1)
+          new_pos = video_widget.player.position() - step_ms
+          new_pos <= timeline.start_ms() の場合:
+            _stop_reverse()（_reverse_active = False）
+            video_widget.seek(timeline.start_ms())
+          それ以外: video_widget.seek(new_pos)
+        _on_seek_settled(): video_widget.seek_settled 受信時に
+          _reverse_active が真なら _reverse_step() を呼び、次の
+          ステップへ進める（＝1ステップの実際の描画完了を待ってから
+          次のステップへ、というペーシングを逆再生でも実現）
+        _stop_reverse(): self._reverse_active = False。
+          on_play_clicked() / on_pause_clicked() / _step_frame() /
+          load_video() / closeEvent() の冒頭で呼び、逆再生と他の操作が
+          同時に走らないようにする（QTimerを使わなくなったため
+          isActive()での判定はできず、_reverse_active フラグで判定する）
+
+      1ステップで戻す距離（step_ms）について（2026-07-18、2回目の
+      不具合修正）:
+        ペーシング方式に変更した直後は、旧REVERSE_TICK_MS（当時
+        REVERSE_STEP_MSに改名済み）=40ms固定のままだった。これは
+        「40ms間隔のQTimerで連投する」旧方式（上記参照）の名残の値を
+        そのまま流用していたため、「逆再生が2〜3秒に1コマしか
+        進まない」不具合が発生した。
+        原因: H.264等の圧縮動画は数十〜数百フレームに1回しかキー
+        フレーム（単独復号可能なIフレーム）を持たず、任意位置への
+        シークは「目標より前の直近キーフレームまで戻ってから、目標
+        位置までのフレームを順にデコードし直す」処理になる
+        （Qt Forumでも同様の記述あり）。40msという極めて小さい戻り幅
+        では、毎ステップの目標がほぼ同じキーフレーム区間に収まり
+        続けるため、ほぼ同じ区間を毎回デコードし直すだけで実質的な
+        進行がごくわずか、という非効率な状態になっていた。
+        スクラブ操作（5-3節）がこの問題を起きないのは、ドラッグ中は
+        目標位置がマウスの動きに応じて大きく飛ぶため、1回のシーク
+        コストに対して進む距離が大きく、キーフレーム区間をまたいで
+        効率よく進めるため。
+        対策として、step_msを固定値ではなく「直前のステップに実際に
+        かかった実時間（time.monotonicで計測）× _current_playback_rate()」
+        から動的に算出する方式に変更した。処理が遅ければその分次回は
+        大きく戻るようになるため、スクラブ操作と同様に、遅い環境・
+        動画でも実時間に見合った速度に自然と収束する（1ステップ目のみ
+        比較対象がなく、REVERSE_INITIAL_STEP_MS=40ms相当を初期値として
+        使う）。_current_playback_rate()を使う点は変更なく、タイムラプス
+        設定有効時は順再生と同じ体感速度で巻き戻る（4-1節参照）。
 
   コマ送り・コマ戻り（app/main_window.py _step_frame(direction)）:
     - 1フレーム分のミリ秒数は round(1000 / self._video_fps) で算出する
@@ -2121,7 +2289,7 @@
   レイアウト変更（8章参照）:
     play_button・pause_button・current_time_labelをウィンドウ下部の
     ボタン行から、動画カード内・CustomTimelineの直下（新設の
-    transport_layout）へ移動した。ボタン順序は「⏪ 逆再生」「⏮ コマ戻り」
+    transport_layout）へ移動した。ボタン順序は「◀ 逆再生」「⏮ コマ戻り」
     「⏸ 一時停止」「⏭ コマ送り」「▶ 再生」（ユーザー指定順）。
     ウィンドウ下部のボタン行にはExportボタンのみ残る。
 
@@ -2377,6 +2545,151 @@
     が正しいepoch由来の値になること、classify_points_in_range()が
     全区間Trueになること、interpolate_position()がNoneを返さない
     ことを確認した。
+
+24. Mapillaryへのアプリ内アップロード機能
+----------------------------------------------------------------
+
+  背景（spec.txt 5-7節）:
+    2026-07-18、ユーザーより「Export完了ダイアログに表示している
+    mapillary_tools video_process_and_uploadコマンドを、アプリから
+    直接実行できるUploadボタンをつけられないか」との要望を受けた。
+
+  事前調査（実機、2026-07-18）:
+    - この時点でユーザーの環境ではmapillary_toolsがPATHに通って
+      おらず（pipxでインストール済みだが~/.local/binが$PATHに
+      含まれていなかった）、`pipx ensurepath`での対処を別途案内した。
+    - mapillary_tools 0.14.7を実際にインストールして--helpを確認し、
+      video_process_and_uploadのpositional引数（video_import_path、
+      import_pathは省略可）・--geotag_source等の既存オプションが
+      現行バージョンでも有効であることを確認した。
+    - mapillary_toolsは本ツールのrequirements.txtに記載された正式な
+      依存パッケージではなく、ユーザーが別途PATHにインストールする
+      外部CLIツールという位置づけである（is_mapillary_tools_available()
+      がshutil.whichでのみ検出することからも明らか）。そのため
+      Pythonライブラリとしてimportする設計は避け、既存の
+      validate_export()（5-10節）と同じくsubprocess経由でCLIとして
+      呼び出す設計とした。
+    - 認証状態を事前にチェックする公式なCLIサブコマンドは存在しない
+      （authenticate --helpにlist/status系オプションなし）。設定
+      ファイルを直接パースすることもできるが、mapillary_tools内部
+      実装（config.py）への依存になるため避け、未認証時はアップロード
+      実行時のエラー出力（mapillary_tools自身のstderr）をそのまま
+      表示する方針とした。
+    - `mapillary_tools upload --help`で--dry_run（実際にはMapillary
+      サーバーへ送信せずローカルの一時ディレクトリへシミュレーション
+      する開発用オプション）の存在を確認し、自動テストではこれを
+      使うことで実ネットワーク送信・実アカウント認証なしに
+      upload_export()の正常系・異常系を検証できるようにした
+      （tests/test_mapillary_validator.py）。
+
+  実装の骨子:
+    a) app/mapillary_validator.py:
+       UploadResult（ok/errors/warnings）dataclassと、
+       upload_export(video_path, video_start_time, user_name=None,
+       should_cancel=None, dry_run=False)を追加。validate_export()
+       と同じくsubprocess.Popen + ポーリングによるキャンセル対応・
+       stderrからのERROR/WARNING行抽出パターンを踏襲する。
+       stdin=subprocess.DEVNULLを明示し、万一mapillary_tools側が
+       対話的プロンプトを出そうとしても即座にEOFで失敗し、GUIの
+       バックグラウンドスレッドがハングしないようにしている。
+       dry_run=Trueの場合のみ--dry_runを付与する（本番のアップロード
+       では使わない、テスト専用の引数）。
+    b) app/mapillary_upload_worker.py（新設）:
+       MapillaryUploadWorker(QThread)。MapillaryValidationWorker
+       と同じ構造（finished_upload(object)シグナル、
+       request_cancel()、run()内でupload_export_implを呼ぶ）。
+    c) app/mapillary_upload_dialog.py（新設）:
+       MapillaryUploadDialog(QDialog)。MapillaryValidationDialog
+       と同じ構造（不定形プログレスバー＋キャンセルボタン、
+       finished_uploadでaccept()）。「キャンセルしても中断した
+       時点までは再開可能」の案内文言を追加している
+       （mapillary_tools側のレジューム機能を前提とした案内）。
+    d) app/exporter.py Exporter.build_mapillary_tools_command():
+       user_name: str | None = None を追加し、指定時は
+       " \\\n    --user_name {user_name}" をテンプレート末尾に
+       追記する（手動コピペ用コマンドとアプリ内アップロードの両方で
+       同じ--user_nameが使われるようにするため）。
+    e) app/main_window.py:
+       - _build_menu()にファイルメニュー「Mapillaryユーザー名...」
+         （mapillary_username_action）を追加。
+         on_edit_mapillary_username_clicked()でQInputDialog.getText
+         （現在値を初期表示、空欄でOKすると未設定に戻せる）を開き、
+         _set_mapillary_user_name()で保存する。
+       - _get_mapillary_user_name()/_set_mapillary_user_name()は
+         QSettings経由でOS標準の設定ストレージ（macOSでは
+         ~/Library/Preferences/）に永続化する。_mapillary_settings()
+         で QSettings(QSettings.Format.IniFormat,
+         QSettings.Scope.UserScope, SETTINGS_ORG, SETTINGS_APP) を
+         明示的に使う。素の QSettings(org, app) だとmacOSでは常に
+         NativeFormat（plist）に解決され、QSettings.setPath()による
+         リダイレクトが効かずテストが実際のユーザー設定を汚染して
+         しまうため（実機・テストで確認済み）、IniFormat+UserScopeを
+         明示することでQSettings.setPath()が効くようにしている
+         （tests/test_main_window.pyのisolated_qsettingsフィクスチャ、
+         autouseで全テストに適用）。
+       - on_export_clicked(): 出力完了後、
+         is_mapillary_tools_available_impl()がTrueの場合のみ
+         _run_local_validation()（5-10節、旧
+         _validate_export_and_format_message()を検証実行部分と
+         メッセージ整形部分に分割したもの）を呼ぶ。can_upload =
+         （検証結果が存在し、かつresult.ok）で判定し、
+         _show_export_complete_dialog()に渡す。
+       - _show_export_complete_dialog(): 標準のQMessageBox.
+         information()ではなくQMessageBoxインスタンスを直接構築し、
+         addButton("Mapillaryへアップロード",
+         QMessageBox.ButtonRole.ActionRole)でカスタムボタンを追加
+         する。can_upload=Falseの場合はこのボタンをsetEnabled(False)
+         にする。box.exec()後、box.clickedButton()がアップロード
+         ボタンだった場合のみ_start_mapillary_upload()を呼ぶ。
+       - _start_mapillary_upload(): 外部サービスへの公開的な
+         アップロードという不可逆かつ他者に影響する操作のため、
+         実行前にQMessageBox.question()で確認する（既定ボタンは
+         Cancel）。OKされた場合のみMapillaryUploadWorker/
+         MapillaryUploadDialogを生成・実行し（5-10節の
+         _run_local_validation()と同じworker.start()→dialog.exec()→
+         worker.wait()パターン）、結果を_show_upload_result()で
+         成功（警告件数込み）・失敗（エラー内容）・キャンセルの
+         3パターンに分けて表示する。
+
+  テスト:
+    - tests/test_mapillary_validator.py: upload_export()の成功
+      （CAMM埋め込み動画、--dry_run）・GPS無しでの失敗・キャンセル・
+      --user_nameが実際に渡っていることの確認（存在しないプロファイル
+      名を指定した際のエラーメッセージに含まれることで間接的に検証）
+      を追加。既存のvalidate_export()のテスト群と同じく
+      mapillary_tools実機が必要なためpytestmark skipif配下。
+    - tests/test_mapillary_upload_worker.py（新設）:
+      test_mapillary_validation_worker.pyと同じ構造で、フェイクの
+      upload_export_implを使い、mapillary_tools実機なしで
+      Worker/Dialogの配線を検証する。
+    - tests/test_exporter.py: build_mapillary_tools_command()への
+      user_name引数追加のテスト（未指定時は--user_nameを含まない
+      ことも確認）。
+    - tests/test_main_window.py: ユーザー名の既定値・QSettings経由の
+      永続化・別インスタンスをまたいだ永続化・メニュー操作（OK/
+      Cancelそれぞれ）、出力完了ダイアログのアップロードボタンの
+      有効/無効切り替え・クリック時の遷移、_start_mapillary_upload()
+      の確認ダイアログCancel時に何も起きないこと・OK時にworkerが
+      正しいuser_nameで呼ばれ結果メッセージが表示されることを検証。
+
+  バージョン: 新機能追加のためAPP_VERSIONをマイナー更新
+  （1.0.2 → 1.1.0）。
+
+  追記（2026-07-18、同日中の追加修正）: 実機での--dry_run実行時、
+  mapillary_tools自身が「Force the option "filetypes" to be "image"
+  to avoid processing and uploading both the video samples and the
+  videos themselves」という警告を出すことに気づいた。--filetypes
+  ありなしの両方で実機検証した結果、単一動画ファイルを渡す本ツールの
+  使い方では実害（動画ファイル自体の誤アップロード）は確認できな
+  かったが、--filetypes imageを付けても結果（画像件数・アップロード
+  件数）が完全に同一で警告のみ消えることを確認できたため、mapillary_
+  tools自身の推奨に従い、以下3箇所すべてに--filetypes imageを追加
+  した（10章の該当コマンド例も同時に更新）:
+    - exporter.py MAPILLARY_TOOLS_COMMAND_TEMPLATE（手動コピペ用）
+    - mapillary_validator.py upload_export()（アプリ内アップロード）
+    - mapillary_validator.py validate_export()（5-10節ローカル検証。
+      video_process単体でも同じ警告が出ることを実機確認したため
+      あわせて追加）
 
 ================================================================
                               以上

@@ -3,12 +3,12 @@ import os
 import shutil
 
 import pytest
-from PyQt6.QtCore import QUrl
-from PyQt6.QtWidgets import QCheckBox, QDialog, QDoubleSpinBox, QLabel
+from PyQt6.QtCore import QSettings, QUrl
+from PyQt6.QtWidgets import QCheckBox, QDialog, QDoubleSpinBox, QLabel, QMessageBox
 
 from app.camm_encoder import embed_gps_track
 from app.main_window import MainWindow
-from app.mapillary_validator import ValidationResult
+from app.mapillary_validator import UploadResult, ValidationResult
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 SAMPLE_MP4 = os.path.join(FIXTURES_DIR, "sample.mp4")
@@ -17,6 +17,17 @@ SAMPLE_GPX = os.path.join(FIXTURES_DIR, "sample.gpx")
 
 UTC = datetime.timezone.utc
 MP4BOX_AVAILABLE = shutil.which("MP4Box") is not None
+
+
+@pytest.fixture(autouse=True)
+def isolated_qsettings(tmp_path):
+    """MainWindowのMapillaryユーザー名設定はQSettingsで永続化される
+    （24章）。テストが実際のユーザーの~/Library/Preferences/を読み書き
+    してしまわないよう、テストごとに一時ディレクトリへリダイレクトする。"""
+    QSettings.setPath(
+        QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(tmp_path)
+    )
+    yield
 
 
 def _fake_match_chunk(chunk):
@@ -467,6 +478,11 @@ def test_frame_step_buttons_disabled_when_fps_unknown(
 def test_reverse_playback_decrements_position_and_stops_at_start(
     window: MainWindow, qtbot
 ) -> None:
+    """逆再生は各ステップの映像フレーム描画完了（video_widget.seek_settled）
+    を待ってから次のステップに進む非同期処理のため、実イベントループを
+    回しながら収束を待つ（qtbot.waitUntil）。同期的に複数回呼び出す形の
+    検証はできない（そもそも旧実装のその方式が、実機で映像が描画され
+    ない不具合を見逃す一因だった）。"""
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
         window.load_video(SAMPLE_MP4)
@@ -475,30 +491,25 @@ def test_reverse_playback_decrements_position_and_stops_at_start(
     window.video_widget.player.setPosition(1150)
 
     window.on_reverse_clicked()
-    assert window._reverse_timer.isActive() is True
+    assert window._reverse_active is True
 
-    # 実タイマー待ちにせず、ティック処理を直接複数回呼んで決定的に検証する
-    for _ in range(10):
-        window._on_reverse_tick()
+    qtbot.waitUntil(lambda: window._reverse_active is False, timeout=5000)
 
     assert window.video_widget.player.position() == 1000
-    assert window._reverse_timer.isActive() is False
 
 
-def test_play_and_pause_stop_reverse_timer(window: MainWindow, qtbot) -> None:
+def test_play_and_pause_stop_reverse(window: MainWindow, qtbot) -> None:
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
         window.load_video(SAMPLE_MP4)
 
-    window._reverse_timer.start()
-    assert window._reverse_timer.isActive() is True
+    window._reverse_active = True
     window.on_pause_clicked()
-    assert window._reverse_timer.isActive() is False
+    assert window._reverse_active is False
 
-    window._reverse_timer.start()
-    assert window._reverse_timer.isActive() is True
+    window._reverse_active = True
     window.on_play_clicked()
-    assert window._reverse_timer.isActive() is False
+    assert window._reverse_active is False
 
 
 def test_export_button_disabled_when_ranges_do_not_overlap(
@@ -592,6 +603,44 @@ def test_export_creates_output_files(window: MainWindow, qtbot, tmp_path) -> Non
     assert os.path.exists(gpx_path)
 
 
+def test_reloading_own_exported_synced_video_resets_stale_offset(
+    window: MainWindow, qtbot, tmp_path
+) -> None:
+    """2026-07-18実機で発生した不具合の回帰テスト。GPX・動画を別々に
+    読み込みオフセット調整してExportした直後、同一セッション内で
+    そのExport済み（埋め込みGPSに既にオフセット適用済みの）動画を
+    再読み込みすると、直前のオフセットが生き残って二重に適用され、
+    同期がズレていた。"""
+    window.load_gpx(SAMPLE_GPX)
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(SAMPLE_MP4)
+
+    window.on_offset_changed(2.0)
+    assert window.state.offset_seconds == 2.0
+
+    video_output_path = str(tmp_path / window.exporter.default_video_filename(window.state))
+    video_path, _gpx_path = window.exporter.export(window.state, video_output_path)
+
+    with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
+        window.load_video(video_path)
+
+    assert window.state.offset_seconds == 0.0
+    assert window.offset_widget.offset_seconds() == 0.0
+
+    # sample.gpxの記録点(01:00:00, 01:00:05, 01:00:10)のうち、
+    # offset=2.0でExportした場合、動画位置0msには
+    # 01:00:00+2s=01:00:02に対応する補間位置
+    # (35.0000, 135.0000)-(35.0010, 135.0010)間の2/5点、つまり
+    # (35.0004, 135.0004)が正しく焼き込まれているはず
+    pos = window.gpx_handler.interpolate_position(
+        0,
+        window.state.offset_seconds,
+        window.state.video_creation_time,
+        window.state.video_time_scale,
+    )
+    assert pos == pytest.approx((35.0004, 135.0004), abs=1e-6)
+
+
 def test_on_export_clicked_shows_save_dialog_with_default_filename(
     window: MainWindow, qtbot, monkeypatch
 ) -> None:
@@ -628,8 +677,7 @@ def test_validate_export_skipped_when_mapillary_tools_unavailable(
     window: MainWindow,
 ) -> None:
     # windowフィクスチャは is_mapillary_tools_available_impl=lambda: False
-    message = window._validate_export_and_format_message("dummy.mp4")
-    assert "スキップ" in message
+    assert window._is_mapillary_tools_available_impl() is False
 
 
 def test_validate_export_runs_worker_when_available(qtbot) -> None:
@@ -645,7 +693,8 @@ def test_validate_export_runs_worker_when_available(qtbot) -> None:
     w.state.video_creation_time = datetime.datetime(2026, 7, 12, 1, 0, 0, tzinfo=UTC)
     w.state.video_start_ms = 0
     try:
-        message = w._validate_export_and_format_message("dummy.mp4")
+        result = w._run_local_validation("dummy.mp4")
+        message = w._format_validation_message(result)
         assert "OK" in message
         assert "3件" in message
     finally:
@@ -671,6 +720,157 @@ def test_format_validation_message_variants(window: MainWindow) -> None:
     warn_result = ValidationResult(ok=True, n_images=2, errors=[], warnings=["w1", "w2"])
     warn_message = window._format_validation_message(warn_result)
     assert "警告 2件" in warn_message
+
+
+def test_mapillary_user_name_defaults_to_empty(window: MainWindow) -> None:
+    assert window._get_mapillary_user_name() == ""
+
+
+def test_mapillary_user_name_round_trips_via_qsettings(window: MainWindow) -> None:
+    window._set_mapillary_user_name("alice")
+    assert window._get_mapillary_user_name() == "alice"
+
+
+def test_mapillary_user_name_persists_across_new_window_instance(
+    window: MainWindow, qtbot
+) -> None:
+    """QSettingsによる永続化（24章）。同じ設定ストレージ（isolated_qsettings
+    フィクスチャでリダイレクトされた一時ディレクトリ）を参照する新しい
+    MainWindowインスタンスでも値が引き継がれることを確認する。"""
+    window._set_mapillary_user_name("bob")
+
+    other = MainWindow(match_chunk_impl=_fake_match_chunk)
+    qtbot.addWidget(other)
+    try:
+        assert other._get_mapillary_user_name() == "bob"
+    finally:
+        other.video_widget.player.stop()
+        other.video_widget.player.setSource(QUrl())
+        qtbot.wait(200)
+
+
+def test_edit_mapillary_username_saves_on_ok(
+    window: MainWindow, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "app.main_window.QInputDialog.getText",
+        lambda *a, **k: ("carol", True),
+    )
+    window.on_edit_mapillary_username_clicked()
+    assert window._get_mapillary_user_name() == "carol"
+
+
+def test_edit_mapillary_username_does_nothing_on_cancel(
+    window: MainWindow, monkeypatch
+) -> None:
+    window._set_mapillary_user_name("existing")
+    monkeypatch.setattr(
+        "app.main_window.QInputDialog.getText",
+        lambda *a, **k: ("ignored", False),
+    )
+    window.on_edit_mapillary_username_clicked()
+    assert window._get_mapillary_user_name() == "existing"
+
+
+def test_export_complete_dialog_upload_button_enabled_state(
+    window: MainWindow, monkeypatch
+) -> None:
+    captured: dict = {}
+
+    def fake_exec(self):
+        button = next(
+            b for b in self.buttons() if b.text() == "Mapillaryへアップロード"
+        )
+        captured["enabled"] = button.isEnabled()
+        return None
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+
+    window._show_export_complete_dialog(
+        "v.mp4", "g.gpx", "cmd", "msg", can_upload=False
+    )
+    assert captured["enabled"] is False
+
+    window._show_export_complete_dialog(
+        "v.mp4", "g.gpx", "cmd", "msg", can_upload=True
+    )
+    assert captured["enabled"] is True
+
+
+def test_export_complete_dialog_clicking_upload_starts_upload_flow(
+    window: MainWindow, monkeypatch
+) -> None:
+    def fake_exec(self):
+        button = next(
+            b for b in self.buttons() if b.text() == "Mapillaryへアップロード"
+        )
+        button.click()
+        return None
+
+    monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+
+    called = []
+    monkeypatch.setattr(
+        window, "_start_mapillary_upload", lambda video_path: called.append(video_path)
+    )
+
+    window._show_export_complete_dialog(
+        "v.mp4", "g.gpx", "cmd", "msg", can_upload=True
+    )
+    assert called == ["v.mp4"]
+
+
+def test_start_mapillary_upload_does_nothing_when_confirmation_cancelled(
+    window: MainWindow, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "app.main_window.QMessageBox.question",
+        lambda *a, **k: QMessageBox.StandardButton.Cancel,
+    )
+    started = []
+    monkeypatch.setattr(
+        "app.main_window.MapillaryUploadWorker.start", lambda self: started.append(True)
+    )
+
+    window.state.video_creation_time = datetime.datetime(2026, 7, 12, 1, 0, 0, tzinfo=UTC)
+    window.state.video_start_ms = 0
+    window._start_mapillary_upload("v.mp4")
+
+    assert started == []
+
+
+def test_start_mapillary_upload_runs_worker_and_shows_result_on_confirm(
+    window: MainWindow, monkeypatch, qtbot
+) -> None:
+    monkeypatch.setattr(
+        "app.main_window.QMessageBox.question",
+        lambda *a, **k: QMessageBox.StandardButton.Ok,
+    )
+
+    received_messages = []
+    monkeypatch.setattr(
+        "app.main_window.QMessageBox.information",
+        lambda *a, **k: received_messages.append(a[2] if len(a) > 2 else k.get("text")),
+    )
+
+    window.state.video_creation_time = datetime.datetime(2026, 7, 12, 1, 0, 0, tzinfo=UTC)
+    window.state.video_start_ms = 0
+    window._set_mapillary_user_name("dave")
+
+    received_kwargs = {}
+
+    def fake_upload_export(video_path, video_start_time, user_name=None, should_cancel=None):
+        received_kwargs["video_path"] = video_path
+        received_kwargs["user_name"] = user_name
+        return UploadResult(ok=True, errors=[], warnings=[])
+
+    window._upload_export_impl = fake_upload_export
+
+    window._start_mapillary_upload("v.mp4")
+
+    assert received_kwargs["video_path"] == "v.mp4"
+    assert received_kwargs["user_name"] == "dave"
+    assert any("完了" in m for m in received_messages)
 
 
 def test_force_sync_computes_offset_from_gpx_start_to_video_start_marker(

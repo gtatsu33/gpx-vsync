@@ -239,6 +239,11 @@ def test_seek_clamps_to_start_end_range(video_widget: VideoWidget, qtbot) -> Non
     video_widget.seek(500)  # start(2000)より前 -> クランプされる
     assert video_widget.player.position() == 2000
 
+    # seek()は直前のシークの映像フレーム描画完了を待ってから次のシークを
+    # 発行する（連投すると1枚も描画完了しないまま次に上書きされる不具合
+    # への対処、2026-07-18）。そのため次のseek()の前に完了を待つ。
+    qtbot.waitSignal(video_widget.seek_settled, timeout=2000).wait()
+
     video_widget.seek(9000)  # end(6000)より後 -> クランプされる
     assert video_widget.player.position() == 6000
 
@@ -279,3 +284,23 @@ def test_position_reaching_end_pauses_and_clamps(
 
     assert video_widget.player.position() == 500
     assert video_widget.timeline.position_ms() == 500
+
+
+def test_rapid_seek_calls_settle_at_latest_target(
+    video_widget: VideoWidget, qtbot
+) -> None:
+    """シークバーのドラッグ操作（mouseMoveEventのたびにseek()が高頻度で
+    連投される）を模したテスト。連投されたシークのうち中間の位置は
+    間引かれてよいが、最終的には最後に要求した位置に収束し、映像フレーム
+    の描画（seek_settled）が完了することを保証する（2026-07-18、ドラッグ
+    中に映像が固まる不具合の修正の回帰テスト）。"""
+    with qtbot.waitSignal(video_widget.duration_changed, timeout=10000):
+        video_widget.load(SAMPLE_MP4)
+
+    for ms in [1000, 2000, 3000, 4000, 5000]:
+        video_widget.seek(ms)
+
+    with qtbot.waitSignal(video_widget.seek_settled, timeout=3000):
+        pass
+
+    assert video_widget.player.position() == 5000

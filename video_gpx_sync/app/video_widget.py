@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QPointF, QRect, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPointF, QRect, QTimer, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -10,6 +10,7 @@ MIN_GAP_MS = 100
 HANDLE_HIT_RADIUS_PX = 10
 BAR_MARGIN_PX = 12
 BAR_HEIGHT_PX = 10
+SEEK_FRAME_TIMEOUT_MS = 400
 BAR_TOP_OFFSET_PX = 32
 
 BAR_BG_COLOR = QColor(225, 225, 228)
@@ -224,6 +225,7 @@ class CustomTimeline(QWidget):
 class VideoWidget(QWidget):
     position_changed = pyqtSignal(int)
     duration_changed = pyqtSignal(int)
+    seek_settled = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -240,6 +242,13 @@ class VideoWidget(QWidget):
         layout.addWidget(self.video_output, stretch=1)
         layout.addWidget(self.timeline)
         self.setLayout(layout)
+
+        self._seek_in_flight = False
+        self._pending_seek_ms: int | None = None
+        self._seek_timeout_timer = QTimer(self)
+        self._seek_timeout_timer.setSingleShot(True)
+        self._seek_timeout_timer.timeout.connect(self._on_seek_frame_ready)
+        self.player.videoSink().videoFrameChanged.connect(self._on_seek_frame_ready)
 
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
@@ -272,7 +281,38 @@ class VideoWidget(QWidget):
 
     def seek(self, ms: int) -> None:
         ms = min(max(ms, self.timeline.start_ms()), self.timeline.end_ms())
-        self.player.setPosition(ms)
+        self._request_seek(ms)
+
+    def _request_seek(self, ms: int) -> None:
+        """一時停止中のシークは、Qt6のマルチメディアバックエンドの制限に
+        より、短い間隔で連投すると映像フレームの描画が1枚も完了しない
+        まま次のシークに上書きされ続けることがある（シークバーの
+        ドラッグ操作・逆再生の両方で実機確認済み、2026-07-18）。
+        そのため、処理中のシークがあれば新しい目標位置だけを保持して
+        追い越さず、_on_seek_frame_ready()での完了検知後に最新の目標へ
+        改めてシークする。"""
+        self._pending_seek_ms = ms
+        if not self._seek_in_flight:
+            self._start_next_paced_seek()
+
+    def _start_next_paced_seek(self) -> None:
+        if self._pending_seek_ms is None:
+            return
+        target = self._pending_seek_ms
+        self._pending_seek_ms = None
+        self._seek_in_flight = True
+        self.player.setPosition(target)
+        self._seek_timeout_timer.start(SEEK_FRAME_TIMEOUT_MS)
+
+    def _on_seek_frame_ready(self, *_args: object) -> None:
+        if not self._seek_in_flight:
+            return
+        self._seek_timeout_timer.stop()
+        self._seek_in_flight = False
+        if self._pending_seek_ms is not None:
+            self._start_next_paced_seek()
+        else:
+            self.seek_settled.emit()
 
     def _on_position_changed(self, ms: int) -> None:
         end_ms = self.timeline.end_ms()
@@ -290,8 +330,8 @@ class VideoWidget(QWidget):
 
     def _on_start_changed(self, ms: int) -> None:
         if self.player.position() < ms:
-            self.player.setPosition(ms)
+            self._request_seek(ms)
 
     def _on_end_changed(self, ms: int) -> None:
         if self.player.position() > ms:
-            self.player.setPosition(ms)
+            self._request_seek(ms)
