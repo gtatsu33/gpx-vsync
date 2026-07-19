@@ -1,17 +1,23 @@
 ================================================================
-  Video-GPX Sync Tool - 実装仕様書
-  版数: 2.1  作成日: 2026-07-12（初版）  更新日: 2026-07-15
-  実装方式: Python 3.11+ / PyQt6
+  gpx-vsync - 実装仕様書
+  版数: 2.6  作成日: 2026-07-12（初版）  更新日: 2026-07-19
+  実装方式: Python 3.11+ / PySide6
 ================================================================
 
 1. 技術スタック
 ----------------------------------------------------------------
 
   言語:          Python 3.11以上
-  GUIフレームワーク: PyQt6 (6.11以降)
-  マップ表示:     PyQt6-WebEngine + Leaflet.js (HTML埋め込み)
-  動画再生:      PyQt6.QtMultimedia (QMediaPlayer + QVideoWidget)
-                 ※ PyQt6本体に同梱。別パッケージのインストールは不要
+  GUIフレームワーク: PySide6 (6.11以降)
+                 ※ 2026-07-19、PyQt6から移行（Step29）。QtLocationの
+                 OSMプラグインでの地図ネイティブ化のため、QtLocation
+                 バインディングを持つPySide6を採用した
+  マップ表示:     PySide6のQtLocation（QtQuickWidget + QML、OSMプラグイン）
+                 ※ 2026-07-19、Step30でLeaflet.js+QWebEngineViewから
+                 置き換え（2章・9章参照）
+  動画再生:      PySide6.QtMultimedia (QMediaPlayer + QVideoWidget)
+                 ※ PySide6本体（Addonsパッケージ）に同梱。
+                 別パッケージのインストールは不要
   GPX処理:       gpxpy 1.6.2
   動画トリミング:  ffmpeg (subprocess経由)
   動画へのGPS埋め込み: GPAC / MP4Box (subprocess経由)
@@ -19,7 +25,10 @@
                    （外部公開デモサーバー、要インターネット接続。13章）
 
   依存パッケージ:
-    pip install PyQt6 PyQt6-WebEngine gpxpy requests
+    pip install PySide6 gpxpy requests
+    ※ PySide6メタパッケージがQtWebEngine/QtMultimedia等（旧
+    PyQt6-WebEngine相当）を含むAddonsも併せてインストールするため、
+    個別パッケージの追加インストールは不要
 
   外部ツール（別途インストール）:
     brew install ffmpeg
@@ -29,10 +38,16 @@
                                      ffmpeg/GPACと異なり必須ではない任意ツール
                                      （未インストールなら検証をスキップするのみ）
 
-  参考バージョン確認日: 2026-07-12（PyPI直接確認）
+  参考バージョン確認日: 2026-07-12（PyPI直接確認、PyQt6時代の記録）
     - PyQt6: 6.11.0 (PyPI)
     - PyQt6-WebEngine: 6.11.0 (PyPI)
     - gpxpy: 1.6.2 (PyPI, github.com/tkrajina/gpxpy)
+
+  参考バージョン確認日: 2026-07-19（PyPI直接確認、PySide6移行時）
+    - PySide6: 6.11.1 (PyPI)。QtLocation/QtPositioningは
+      PySide6-Addonsに含まれ、`pip install PySide6`のメタ
+      パッケージ経由で自動的に入る（PySide6-Essentials/Addons分割
+      構成、doc.qt.io/qtforpython-6/package_details.html で確認）
     - mapillary_tools: 0.14.7 (github.com/mapillary/mapillary_tools)
       ※ mapillary_toolsのバージョンは実際の連携時に再確認すること
 
@@ -54,39 +69,47 @@
 2. マップ表示の実装方針
 ----------------------------------------------------------------
 
-  PyQt6のネイティブマップ機能（QtLocation）はPyQt6では
-  Pythonバインディングが不完全なため、
-  「QWebEngineView + Leaflet.js」の組み合わせを採用する。
+  Qtのネイティブマップ機能（QtLocation）は、当初採用していたPyQt6には
+  Pythonバインディングが存在しないため（Qt Forum・実機のvenv調査で
+  確認済み）、「QWebEngineView + Leaflet.js」の組み合わせを採用していた
+  （旧実装。9章の履歴参照）。
+
+  2026-07-19、GUIフレームワークをQtLocationバインディングを持つ
+  PySide6へ移行（Step29、1章参照）した上で、地図表示自体もQtLocationの
+  OSMプラグイン（QML）によるネイティブ実装へ置き換えた（Step30）。
+  QWebEngineView（Chromium同梱）への依存を解消し、将来.appとして
+  再配布する際のバイナリサイズ肥大化を避けることが目的。
 
   具体的には:
-  1. アプリ起動時にLeaflet.jsを使ったHTMLを生成してQWebEngineViewに読み込む
+  1. アプリ起動時に app/map_widget.py（QQuickWidget継承）が
+     assets/map.qml をロードする
   2. GPXルート・現在地マーカーの更新はPython側から
-     QWebEnginePage.runJavaScript() で Leaflet APIを呼び出して行う
-     （HTMLの再ロードは不要 → チラつきなし）
-
-  マーカー更新のJS呼び出し例:
-    self.map_view.page().runJavaScript(
-        f"marker.setLatLng([{lat}, {lon}]);"
-        f"map.panTo([{lat}, {lon}]);"
-    )
+     QQuickWidget.rootObject() 経由でQML側のfunction
+     （loadRoute/updateRouteRanges/updateMarker/hideMarker/clearMap）
+     を直接呼び出して行う（詳細は9章）
 
   OSMタイルURL:
-    https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
+    https://tile.openstreetmap.org/{z}/{x}/{y}.png
     Attribution: © OpenStreetMap contributors (表示必須)
 
-  Leaflet.js: CDN (https://unpkg.com/leaflet@1.9.4/) を使用
-  ※ オフラインキャッシュは今回スコープ外
+  重要な注意点（実機検証で判明。Qt 6.11）:
+    QtLocationの`osm`プラグインは、デフォルトのactiveMapTypeがQt社の
+    プロキシ経由でThunderforestのタイル（APIキー要求の透かし入り）を
+    使う設定になっており、単純に`Plugin{name:"osm"}`を指定しただけでは
+    上記のOSM直接タイルにはならない。`osm.mapping.custom.host`
+    プラグインパラメータで独自のCustomMapタイプを追加し、
+    `Map.activeMapType`をそのタイプへ明示的に切り替える処理が必要
+    （9章のmap.qml参照）。またQtLocationの`Map`型はLeafletと異なり
+    attribution（著作権表示）を自動描画しないため、QML側で手動の
+    オーバーレイ表示を追加している（OSMタイル利用ポリシー上必須）。
 
-  重要な設定（実機検証で判明）:
-    map_template.html は file:// スキームでローカルから読み込むが、
-    QWebEngineSettingsのデフォルトでは file:// ページはリモートURL
-    （Leaflet CDN）へのアクセスが禁止されており、この設定なしでは
-    Leafletスクリプト自体が読み込めず "L is not defined" エラーに
-    なることを実機で確認した。MapWidget初期化時に以下を必ず設定する:
-      self.settings().setAttribute(
-          QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
-          True
-      )
+  地図の操作性（実機検証で判明。Step30-9、2026-07-19）:
+    QtLocationの`Map`型は、Leafletと異なりデフォルトではマウス/
+    トラックパッド操作でのパン・ズームに対応していない（Qt公式
+    ドキュメント doc.qt.io/qt-6/qml-qtlocation-map.html のInteractivity
+    サンプルで確認）。`PinchHandler`（ピンチズーム・回転）、
+    `WheelHandler`（マウスホイールズーム）、`DragHandler`（ドラッグ
+    パン）をMap要素に明示的に追加する必要がある（9章のmap.qml参照）。
 
 
 3. ディレクトリ構成
@@ -99,7 +122,7 @@
   │   ├── state.py          # AppState: アプリケーション状態のデータクラス
   │   ├── main_window.py    # QMainWindow: 全体レイアウト管理
   │   ├── theme.py          # 配色パレット・QSS定義、ライト/ダーク自動切替（16章）
-  │   ├── map_widget.py     # QWebEngineView ラッパー + Leaflet連携
+  │   ├── map_widget.py     # QQuickWidget ラッパー + QtLocation(QML)連携
   │   ├── video_widget.py   # QMediaPlayer + QVideoWidget + タイムライン
   │   ├── offset_widget.py  # GPSオフセット調整ボタン群
   │   ├── timelapse_widget.py  # タイムラプス設定（チェックボックス＋間隔入力、15章）
@@ -107,7 +130,7 @@
   │   ├── gpx_handler.py    # gpxpy を使ったGPX読み書き・時刻補間
   │   ├── video_handler.py  # ffmpeg subprocess呼び出し、メタデータ取得
   │   ├── camm_encoder.py   # GPAC/MP4Box経由でCAMM GPSトラックの埋め込み・読み出し
-  │   ├── exporter.py       # 動画・GPX出力処理
+  │   ├── exporter.py       # 動画出力処理
   │   ├── map_matcher.py    # Valhalla APIでのマップマッチング、fair-use対応レート制限（13章）
   │   ├── map_matching_worker.py  # QThreadでmap_matcher処理をバックグラウンド実行
   │   ├── map_matching_dialog.py  # マップマッチング進捗ダイアログ（プログレスバー＋キャンセル）
@@ -115,7 +138,7 @@
   │   ├── mapillary_validation_worker.py  # QThreadでmapillary_validator処理をバックグラウンド実行
   │   └── mapillary_validation_dialog.py  # ローカル検証中ダイアログ（不定形インジケーター＋キャンセル）
   ├── assets/
-  │   ├── map_template.html # Leaflet.js を使ったマップHTMLテンプレート
+  │   ├── map.qml            # QtLocation(OSMプラグイン)を使った地図QML
   │   └── icons/
   │       └── check.svg     # チェックボックスのチェックマーク（白、17章）
   └── requirements.txt
@@ -415,28 +438,39 @@
          （件数・エラー・警告、またはスキップ理由）を追記して表示
 
 4-2. MapWidget (app/map_widget.py)
-  - QWebEngineView を継承
+  - QQuickWidget を継承（2026-07-19、Step30でQWebEngineViewから置き換え。
+    9章参照）。assets/map.qml をロードし、setResizeMode(
+    SizeRootObjectToView)でウィジェットサイズに地図を追従させる
   - メソッド:
       load_gpx_route(points: list[tuple[float,float]])
-        → Leaflet polyline を JS で描画（loadRoute()。全区間を
-           一旦「範囲内」扱いで描画する。9章参照）
+        → QML側 loadRoute() を rootObject() 経由で直接呼び出し、
+           MapPolylineでルートを描画（全区間を一旦「範囲内」扱いで
+           描画する。9章参照）
       update_route_ranges(in_range: list[bool])
-        → runJavaScript で updateRouteRanges() を呼び、load_gpx_route()
-           で描画済みのルートをin_range（各点が動画のStart/End出力
+        → QML側 updateRouteRanges() を呼び、load_gpx_route()で
+           描画済みのルートをin_range（各点が動画のStart/End出力
            範囲内かどうか）に応じて2色に塗り分け直す（20章）。
-           座標は再送しない（JS側がloadRoute()時点で保持している）
+           座標は再送しない（QML側がloadRoute()時点で保持している）
       update_marker(lat: float, lon: float)
-        → runJavaScript で marker.setLatLng() + panTo()
+        → QML側 updateMarker() を呼び、MapQuickItemの座標更新+
+           Map.centerへの追従（Leaflet版panTo相当）
       hide_marker()
-        → runJavaScript で marker を非表示化
+        → QML側 hideMarker() を呼び、マーカーを非表示化
            （interpolate_position が None を返した場合に呼び出す）
       clear()
-        → ルートとマーカーを消去
+        → QML側 clearMap() を呼び、ルートとマーカーを消去
 
-  注: QWebEngineView と QVideoWidget（4-3節）を同一ウィンドウ内で
-  併用するため、main.py で QApplication インスタンス生成前に
+  - _is_ready / _pending_calls によるキューイング機構は維持しているが、
+    QQuickWidgetはローカルQMLファイルの場合setSource()が同期的に
+    Status.Readyへ遷移するため、通常の起動フローでは実質的に
+    キューされることはない（防御的な実装として残している。9章参照）
+
+  注: QQuickWidget（QtQuick描画）と QVideoWidget（4-3節、QtMultimedia
+  描画）を同一ウィンドウ内で併用するため、main.py で QApplication
+  インスタンス生成前に
   QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
-  を呼び出しておく必要がある（OpenGLコンテキスト共有の事前設定）。
+  を呼び出しておく必要がある（OpenGLコンテキスト共有の事前設定。
+  Leaflet版のQWebEngineView時代から変わらず必要）。
 
 4-3. VideoWidget (app/video_widget.py)
   - QWidget を継承
@@ -448,7 +482,7 @@
   - シグナル:
       position_changed(ms: int)  # 再生位置が変わるたびに発火
 
-  - QMediaPlayer の使い方（PyQt6 最新版）:
+  - QMediaPlayer の使い方（Qt6最新版。PySide6/PyQt6でAPI共通）:
       self.player = QMediaPlayer()
       self.audio  = QAudioOutput()
       self.player.setAudioOutput(self.audio)
@@ -570,7 +604,7 @@
       構築したGPXHandlerは、以降get_all_points()等の既存メソッド
       経由でしか参照されないため、load()で読み込んだ通常のGPXHandler
       と完全に等価に扱える（interpolate_position/has_overlap/
-      classify_points_in_range/export_trimmed等すべてがそのまま使える）。
+      classify_points_in_range等すべてがそのまま使える）。
   - get_all_points() -> list[GPXTrackPoint]
       GPX内の全トラック・全セグメントのポイントを時刻順にソートし、
       1本の連続した点列として返す（複数トラック/セグメントも結合する）
@@ -597,22 +631,10 @@
       playback_ms_to_real_ms()（app/time_utils.py）は
       round(video_time_ms * video_time_scale) を返すだけの単純な
       関数。デフォルト1.0（通常動画）では従来と全く同じ結果になる。
-      export_trimmed() / get_points_for_camm() /
-      _build_output_points() / _raw_time_range() / has_overlap() にも
-      同じ video_time_scale 引数（デフォルト1.0）を追加し、
-      内部で playback_ms_to_real_ms() を使って一貫して実世界時刻に
-      変換する（フェーズ2で対応。15章）。
-  - export_trimmed(output_path: str,
-                   video_start_ms: int,
-                   video_end_ms: int,
-                   offset_sec: float,
-                   video_creation_time: datetime,
-                   video_time_scale: float = 1.0)
-    ロジック:
-      _build_output_points()（下記）で得た点列を、真の絶対時刻
-      （true_time）付きのGPXTrackPointに変換し、
-      オフセット適用済みの時刻でGPX 1.1 として書き出す
-      gpx.to_xml() で出力
+      get_points_for_camm() / _build_output_points() /
+      _raw_time_range() / has_overlap() にも同じ video_time_scale
+      引数（デフォルト1.0）を追加し、内部で playback_ms_to_real_ms()
+      を使って一貫して実世界時刻に変換する（フェーズ2で対応。15章）。
 
   - get_points_for_camm(video_start_ms: int,
                         video_end_ms: int,
@@ -638,19 +660,20 @@
         # 圧縮されていても正しい実時刻が得られる（15章）
     video_time_scale=1.0（通常動画）では relative_ms = real_ms_delta
     となり、動作は変更前と完全に同じになる。
-    ロジックの大部分（対象範囲抽出・境界補間）は export_trimmed() と
-    共通のため、_build_output_points() という内部メソッドに集約し、
-    export_trimmed() と get_points_for_camm() の両方から呼び出す。
+    対象範囲抽出・境界補間ロジックは、_build_output_points() という
+    内部メソッドに集約している（2026-07-19以前は、廃止済みの
+    export_trimmed()（バックアップ用GPX単体出力。25章参照）とも
+    共通ロジックとして共有していた名残）。
 
   - _build_output_points(video_start_ms, video_end_ms, offset_sec,
                          video_creation_time, video_time_scale=1.0)
       -> list[tuple[datetime, float, float, float | None]]
     （true_time, latitude, longitude, elevation）のリストを返す
-    内部共通ヘルパー。true_time は常に実世界の絶対時刻
-    （video_time_scale適用済み）であり、動画自身の圧縮タイムライン上の
-    位置ではない点に注意（コンテナ内配置への変換はget_points_for_camm
-    側でreal_ms_to_playback_ms()を使って行う）。境界補間ロジック
-    （4-6節の既存export_trimmedロジック）をここに集約する。
+    内部ヘルパー（get_points_for_camm()が使用）。true_time は常に
+    実世界の絶対時刻（video_time_scale適用済み）であり、動画自身の
+    圧縮タイムライン上の位置ではない点に注意（コンテナ内配置への
+    変換はget_points_for_camm側でreal_ms_to_playback_ms()を使って
+    行う）。
 
   - replace_points(points: list[gpxpy.gpx.GPXTrackPoint]) -> None
     マップマッチング（13章・4-11節）完了後、self.gpx を単一トラック・
@@ -658,7 +681,7 @@
     既存の複数トラック/セグメント構造は破棄されるが、get_all_points()
     はもともと全トラック・セグメントを時刻順に結合した1本の点列として
     扱う設計であり（4-6節冒頭）、他の全メソッド（interpolate_position/
-    has_overlap/export_trimmed/get_points_for_camm）はget_all_points()
+    has_overlap/get_points_for_camm）はget_all_points()
     経由でしか点列を参照しないため、置き換え後も既存ロジックへの影響は
     ない。MainWindow.load_gpx()（4-1節）からのみ呼ばれる想定。
 
@@ -970,31 +993,22 @@
       （連番は付与しない。保存ダイアログ自体がOS標準の上書き確認を
       行うため）
 
-  - export(state: AppState, video_output_path: str)（22章、
+  - export(state: AppState, video_output_path: str) -> str（22章、
     2026-07-15変更: 第2引数が output_dir から video_output_path に
-    変更された）
+    変更された。2026-07-19変更: 戻り値がtuple[str, str]（動画・GPX
+    パス）からstr（動画パスのみ）に変更。GPX単体出力機能を廃止した
+    ため。25章参照）
     1. GPXとオフセット適用後の時刻範囲が動画Start〜Endと重複するか
        事前チェック（重複しない場合はこの関数を呼び出せない
        ＝出力ボタンが無効化されている想定）
-    2. video_output_path の親ディレクトリをGPX出力先とし、GPX出力
-       ファイル名を生成:
-         gpx_name = f"{元GPXファイル名（拡張子除く）}_synced.gpx"
-       動画側は video_output_path をそのまま使う（保存ダイアログで
-       ユーザーが明示的に指定した値であり、連番付与は行わない）
-    3. GPX出力先に同名ファイルが存在する場合は連番を付与:
-         例: "ride01_synced.gpx" が存在すれば
-             "ride01_synced_2.gpx" のように連番を増やして
-             重複しなくなるまで繰り返す（generate_output_path()。
-             動画側は保存ダイアログの時点でOS標準の上書き確認が
-             既に行われているため、この連番ロジックは対象外）
-    4. VideoHandler.export_trimmed() を呼び出し、一時パスに
+    2. VideoHandler.export_trimmed() を呼び出し、一時パスに
        Smart Cut済み動画（creation_time設定込み）を書き出す
-    5. GPXHandler.get_points_for_camm() でCAMM用の点列を取得し、
-       CammEncoder.embed_gps_track() を呼び出して、4.の一時動画に
+    3. GPXHandler.get_points_for_camm() でCAMM用の点列を取得し、
+       CammEncoder.embed_gps_track() を呼び出して、2.の一時動画に
        CAMMトラックを追加した最終版を video_output_path の場所に
-       書き出す（4.の一時ファイルは削除する）
-    6. GPXHandler.export_trimmed() を呼び出し、バックアップ用の
-       GPXファイルを書き出す
+       書き出す（2.の一時ファイルは削除する）。動画側は
+       video_output_path をそのまま使う（保存ダイアログでユーザーが
+       明示的に指定した値であり、連番付与は行わない）
     ※ 完了ダイアログの表示・mapillary_toolsコマンド例の生成・14章の
     ローカル検証の起動は Exporter.export() の責務ではなく、
     MainWindow.on_export_clicked()（4-1節）が export() 完了後に
@@ -1353,6 +1367,11 @@
   マップのJS呼び出しはその都度行ってもよいが、頻度が高いため、
   必要であれば間引き（例: 前回呼び出しから100ms未満ならスキップ）を
   検討してもよい。
+  2026-07-19追記: PySide6移行（Step29-4）後、実サンプル動画
+  （tests/fixtures/sample.mp4）を使った既存の自動テスト一式が
+  全てグリーンのままであることを確認済み。上記の実測値そのものを
+  PySide6環境で再測定する専用の手動検証は未実施のため、フェーズ2の
+  地図実装変更時に併せて再確認する。
 
 
 6. 動画開始時刻の扱い
@@ -1450,119 +1469,214 @@
   transport_layout（再生制御ボタン群）の詳細は19章を参照
 
 
-9. map_template.html の構成
+9. map.qml の構成（2026-07-19、Step30でLeaflet版から全面置き換え）
+
 ----------------------------------------------------------------
 
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <style>
-      body { margin: 0; padding: 0; }
-      #map { width: 100%; height: 100vh; }
-    </style>
-  </head>
-  <body>
-    <div id="map"></div>
-    <script>
-      var map = L.map('map').setView([35.0, 135.0], 13);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a> contributors'
-      }).addTo(map);
+  地図表示はQtLocationのOSMプラグイン（QML）によるネイティブ実装に
+  置き換えた。Python側の呼び出しはQWebEnginePage.runJavaScript()に
+  よるJS文字列組み立てから、QQuickWidget.rootObject()経由のQML
+  function直接呼び出しに変わったが、MapWidgetクラスの公開メソッド名・
+  シグネチャ（load_gpx_route/update_route_ranges/update_marker/
+  hide_marker/clear）はLeaflet版から変更していない（main_window.py側の
+  呼び出しコードは無変更）。
 
-      var currentLatLngs = [];  // loadRoute()で保持し、updateRouteRanges()で再利用する
-      var routeSegments = [];   // ルート線を構成するL.Polylineの配列（20章）
-      var marker = null;
+  import QtQuick
+  import QtLocation
+  import QtPositioning
 
-      function clearRouteSegments() {
-          routeSegments.forEach(function(line) { map.removeLayer(line); });
-          routeSegments = [];
+  Map {
+      id: root
+      width: 800
+      height: 600
+
+      plugin: Plugin {
+          id: osmPlugin
+          name: "osm"
+
+          // Qt標準のosmプラグインは、デフォルトのactiveMapTypeが
+          // Qt社のプロキシ経由Thunderforestタイル（APIキー要求の
+          // 透かし入り）になっている（Qt 6.11で実機確認）。
+          // osm.mapping.host単体では効かず、osm.mapping.custom.hostで
+          // 独自のCustomMapタイプを追加した上で、Map.activeMapTypeを
+          // 明示的にそのタイプへ切り替える必要がある。
+          PluginParameter { name: "osm.useragent"; value: "GPX-VSync/1.0" }
+          PluginParameter {
+              name: "osm.mapping.custom.host"
+              value: "https://tile.openstreetmap.org/"
+          }
+          PluginParameter {
+              name: "osm.mapping.custom.copyright"
+              value: "&copy; OpenStreetMap contributors"
+          }
+      }
+
+      center: QtPositioning.coordinate(35.0, 135.0)
+      zoomLevel: 13
+
+      // 操作性（パン・ズーム）。Map型はデフォルトでは対話操作に
+      // 対応していないため、Qt公式Interactivityサンプルに準拠して
+      // 明示的に追加（Step30-9、2章参照）
+      property geoCoordinate startCentroid
+
+      PinchHandler {
+          id: pinchHandler
+          target: null
+          onActiveChanged: if (active) {
+              root.startCentroid = root.toCoordinate(pinchHandler.centroid.position, false)
+          }
+          onScaleChanged: (delta) => {
+              root.zoomLevel += Math.log2(delta)
+              root.alignCoordinateToPoint(root.startCentroid, pinchHandler.centroid.position)
+          }
+          onRotationChanged: (delta) => {
+              root.bearing -= delta
+              root.alignCoordinateToPoint(root.startCentroid, pinchHandler.centroid.position)
+          }
+          grabPermissions: PointerHandler.TakeOverForbidden
+      }
+
+      WheelHandler {
+          id: wheelHandler
+          acceptedDevices: Qt.platform.pluginName === "cocoa" || Qt.platform.pluginName === "wayland"
+              ? PointerDevice.Mouse | PointerDevice.TouchPad
+              : PointerDevice.Mouse
+          rotationScale: 1 / 120
+          property: "zoomLevel"
+      }
+
+      DragHandler {
+          id: dragHandler
+          target: null
+          onTranslationChanged: (delta) => root.pan(-delta.x, -delta.y)
+      }
+
+      property var routeLatLngs: []
+      property var routeSegments: []
+
+      function loadRoute(latlngs) {
+          routeLatLngs = latlngs;
+          var flags = [];
+          for (var i = 0; i < latlngs.length; i++) flags.push(true);
+          updateRouteRanges(flags);
+          if (latlngs.length > 0) {
+              var coords = [];
+              for (var i = 0; i < latlngs.length; i++) {
+                  coords.push(QtPositioning.coordinate(latlngs[i][0], latlngs[i][1]));
+              }
+              root.visibleRegion = QtPositioning.rectangle(coords);  // Leaflet版fitBounds相当
+          }
       }
 
       // inRangeFlagsの切り替わり目でセグメントに分割する。継ぎ目が
-      // 途切れないよう、直前の点も新セグメントの先頭に含める。
-      function splitIntoSegments(latlngs, inRangeFlags) {
+      // 途切れないよう、直前の点も新セグメントの先頭に含める
+      // （Leaflet版splitIntoSegments/renderRouteSegments相当）。
+      function updateRouteRanges(inRangeFlags) {
           var segments = [];
           var current = null;
-          for (var i = 0; i < latlngs.length; i++) {
+          for (var i = 0; i < routeLatLngs.length; i++) {
               var flag = inRangeFlags[i];
               if (!current || current.inRange !== flag) {
                   if (current) segments.push(current);
-                  current = {inRange: flag, latlngs: []};
-                  if (i > 0) current.latlngs.push(latlngs[i - 1]);
+                  current = { inRange: flag, path: [] };
+                  if (i > 0) {
+                      current.path.push(QtPositioning.coordinate(
+                          routeLatLngs[i - 1][0], routeLatLngs[i - 1][1]));
+                  }
               }
-              current.latlngs.push(latlngs[i]);
+              current.path.push(QtPositioning.coordinate(routeLatLngs[i][0], routeLatLngs[i][1]));
           }
           if (current) segments.push(current);
-          return segments;
+          routeSegments = segments;
       }
 
-      function renderRouteSegments(inRangeFlags) {
-          clearRouteSegments();
-          if (currentLatLngs.length === 0) return;
-          var segments = splitIntoSegments(currentLatLngs, inRangeFlags);
-          segments.forEach(function(seg) {
-              if (seg.inRange) {
-                  routeSegments.push(
-                      L.polyline(seg.latlngs, {color: '#16a34a', weight: 3}).addTo(map)
-                  );
-              } else {
-                  // クロップされる領域: 範囲内と同じ太さのグレー単色
-                  // （緑の縁取りなし。20章参照）
-                  routeSegments.push(
-                      L.polyline(seg.latlngs, {color: '#6b7280', weight: 3}).addTo(map)
-                  );
-              }
-          });
-      }
-
-      function loadRoute(latlngs) {
-          currentLatLngs = latlngs;
-          renderRouteSegments(latlngs.map(function() { return true; }));
-          if (latlngs.length > 0) {
-              map.fitBounds(L.latLngBounds(latlngs));
-          }
-      }
-
-      function updateRouteRanges(inRangeFlags) {
-          renderRouteSegments(inRangeFlags);
-      }
+      property var markerCoordinate: QtPositioning.coordinate(0, 0)
+      property bool markerVisible: false
 
       function updateMarker(lat, lon) {
-          if (!marker) {
-              marker = L.circleMarker([lat, lon], {
-                  radius: 8, color: 'red', fillColor: '#f03',
-                  fillOpacity: 0.8
-              }).addTo(map);
-          } else {
-              marker.setLatLng([lat, lon]);
-              marker.setStyle({opacity: 1, fillOpacity: 0.8});
-          }
-          map.panTo([lat, lon]);
+          markerCoordinate = QtPositioning.coordinate(lat, lon);
+          markerVisible = true;
+          root.center = markerCoordinate;  // Leaflet版map.panTo相当（spec.txt 5-2節）
       }
 
       function hideMarker() {
-          if (marker) {
-              marker.setStyle({opacity: 0, fillOpacity: 0});
-          }
+          markerVisible = false;
       }
 
       function clearMap() {
-          clearRouteSegments();
-          currentLatLngs = [];
-          if (marker) { map.removeLayer(marker); marker = null; }
+          routeLatLngs = [];
+          routeSegments = [];
+          markerVisible = false;
       }
-    </script>
-  </body>
-  </html>
 
-  Python側からの呼び出し例:
-    page.runJavaScript(f"loadRoute({json.dumps(latlngs)});")
-    page.runJavaScript(f"updateRouteRanges({json.dumps(in_range)});")
-    page.runJavaScript(f"updateMarker({lat}, {lon});")
-    page.runJavaScript("hideMarker();")
-    page.runJavaScript("clearMap();")
+      MapItemView {
+          model: root.routeSegments
+          delegate: MapPolyline {
+              line.width: 3
+              line.color: modelData.inRange ? "#16a34a" : "#6b7280"
+              path: modelData.path
+          }
+      }
+
+      MapQuickItem {
+          coordinate: root.markerCoordinate
+          visible: root.markerVisible
+          anchorPoint.x: markerShape.width / 2
+          anchorPoint.y: markerShape.height / 2
+          sourceItem: Rectangle {
+              id: markerShape
+              width: 16; height: 16; radius: 8
+              color: "#f03"; opacity: 0.8
+              border.color: "red"; border.width: 1
+          }
+      }
+
+      onSupportedMapTypesChanged: {
+          for (var i = 0; i < supportedMapTypes.length; i++) {
+              if (supportedMapTypes[i].name === "Custom URL Map") {
+                  activeMapType = supportedMapTypes[i];
+                  return;
+              }
+          }
+          if (supportedMapTypes.length > 0) {
+              activeMapType = supportedMapTypes[supportedMapTypes.length - 1];
+          }
+      }
+
+      // QtLocationのMap型はLeafletと異なりattributionを自動描画しない
+      // ため、OSMタイル利用ポリシーに従い手動でオーバーレイ表示する。
+      Rectangle {
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          width: attributionText.implicitWidth + 8
+          height: attributionText.implicitHeight + 4
+          color: "#ccffffff"
+          Text {
+              id: attributionText
+              anchors.centerIn: parent
+              text: "© OpenStreetMap contributors"
+              font.pixelSize: 11
+              color: "#333333"
+          }
+      }
+  }
+
+  Python側からの呼び出し例（app/map_widget.py）:
+    self._call_qml("loadRoute", latlngs)               # rootObject().loadRoute(latlngs)
+    self._call_qml("updateRouteRanges", in_range)
+    self._call_qml("updateMarker", lat, lon)
+    self._call_qml("hideMarker")
+    self._call_qml("clearMap")
+
+  QQuickWidget特有の注意点（実機検証で判明。QWebEngineViewとの違い）:
+    ローカルファイルのQMLはsetSource()が同期的にStatus.Readyへ遷移する
+    （QWebEngineViewのloadFinishedのような非同期待ちが基本的に発生
+    しない）。そのためMapWidgetの_pending_callsキューイング機構は
+    通常のアプリ起動フローでは実質的に使われない（防御的な実装として
+    維持）。map_readyシグナルも同様にコンストラクタ内で同期的に
+    発火しうるため、ウィジェット生成後に外部から接続しても捕捉できない
+    可能性がある点に注意（現状main_window.pyはこのシグナルを使用して
+    いない）。
 
 
 10. mapillary_toolsとの連携
@@ -1703,24 +1817,29 @@
 12. 開発・実行手順
 ----------------------------------------------------------------
 
-  # 環境構築
+  # 環境構築（.venvはリポジトリ直下 gpx-vsync/.venv に統一。
+  # 2026-07-19、Step29のPySide6移行に伴いvideo_gpx_sync/.venvから
+  # 移設した。理由: ユーザーの開発運用がリポジトリ直下でのvenv
+  # activateに統一されているため）
+  cd gpx-vsync                  # リポジトリ直下
   brew install ffmpeg gpac
   python -m venv .venv
   source .venv/bin/activate
-  pip install -r requirements.txt
+  pip install -r video_gpx_sync/requirements.txt
 
   # 実行
+  cd video_gpx_sync
   python main.py
 
-  # requirements.txt
-  PyQt6>=6.11.0
-  PyQt6-WebEngine>=6.11.0
+  # requirements.txt (video_gpx_sync/requirements.txt)
+  PySide6>=6.11.1
   gpxpy>=1.6.2
   requests>=2.32.0
 
   # デスクトップからの起動（簡易ランチャー）
   video_gpx_sync/GPX-VSync.app を Finder でダブルクリックすると、
-  .venv を activate した上で main.py が起動する。Desktop等への
+  リポジトリ直下（video_gpx_syncの1階層上）の .venv を activate した
+  上で、video_gpx_sync に cd してから main.py が起動する。Desktop等への
   エイリアス作成は任意（元の video_gpx_sync/GPX-VSync.app 自体を
   移動すると相対パス解決が壊れるため、移動する場合はエイリアス
   （シンボリックリンクではなくFinderの「エイリアスを作成」）を使うこと）。
@@ -2019,9 +2138,10 @@
       レイアウトに16px/12px/8px程度の余白を追加）
 
   CustomTimeline（app/video_widget.py）・地図ルート線
-  （assets/map_template.html）の配色統一:
+  （2026-07-19以降はassets/map.qml、当時はassets/map_template.html）
+  の配色統一:
     QSSの適用範囲外であるQPainterによる直接描画（タイムラインの
-    選択範囲ハイライト）と、Leaflet.jsのポリライン（GPXルート線）に
+    選択範囲ハイライト）と、地図側のポリライン（GPXルート線）に
     ついても、既存の任意色（青系）からアクセントグリーン
     （#16a34a、ハイライトは半透明の rgba(22,163,74,150)）に変更し、
     視覚的な一貫性を持たせた。現在位置を示す赤い縦線、Start/End
@@ -2319,17 +2439,19 @@
       get_all_points()と同じ順序でin_range: list[bool]を返す
     - MapWidget.update_route_ranges(in_range)（4-2節）:
       JS側のupdateRouteRanges()を呼ぶ
-    - map_template.html（9章）: loadRoute()はcurrentLatLngsに緯度経度を
-      保持するよう変更（Start/End操作のたびに全点を再送しないため）。
+    - map.qml（9章。2026-07-19以前はmap_template.html）:
+      loadRoute()はrouteLatLngsに緯度経度を保持するよう変更
+      （Start/End操作のたびに全点を再送しないため）。
       updateRouteRanges(inRangeFlags)は、隣接する点のinRangeFlagが
       切り替わる箇所でセグメントに分割し、区間ごとに再描画する
-      （splitIntoSegments()。セグメントの継ぎ目が視覚的に途切れない
-      よう、直前の点を新セグメントの先頭にも含める）
-    - 配色: 範囲内は従来通り緑の太線（#16a34a、weight 3）。範囲外は
-      グレーの太線（#6b7280、weight 3）
-      （実機でLeafletの実ページに対しrunJavaScript()を実行し、
-      routeSegmentsの長さ・各セグメントの色/太さ/点数が意図通りに
-      なることを検証済み）
+      （セグメントの継ぎ目が視覚的に途切れないよう、直前の点を
+      新セグメントの先頭にも含める。Leaflet版splitIntoSegments()と
+      同一ロジックをQMLへ移植）
+    - 配色: 範囲内は従来通り緑の太線（#16a34a、line.width 3）。範囲外は
+      グレーの太線（#6b7280、line.width 3）
+      （Leaflet版は実機でrunJavaScript()を実行し検証。QML版もStep30-2で
+      実際にMapPolyline描画のスクリーンショットを確認し、セグメントの
+      色分け・継ぎ目が途切れないことを検証済み）
     - MainWindow._update_route_range_highlight()（4-1節）: GPX・動画の
       両方が読み込み済みの場合のみclassify_points_in_range()→
       update_route_ranges()を呼ぶ。on_start_changed() / on_end_changed() /
@@ -2690,6 +2812,49 @@
     - mapillary_validator.py validate_export()（5-10節ローカル検証。
       video_process単体でも同じ警告が出ることを実機確認したため
       あわせて追加）
+
+25. GPX単体出力機能の廃止
+----------------------------------------------------------------
+
+  背景（spec.txt 5-6節）:
+    2026-07-19、ユーザーより「Exportの際、動画とは別に元GPXの
+    あるフォルダに`{元ファイル名}_synced.gpx`を出力していないか」
+    という確認を受けた。調査の結果、確かに出力していることを確認。
+    この機能は動画にGPS情報を内蔵する（CAMM形式）機能ができる前の
+    「バックアップ・手動確認用」の名残であり、Mapillaryへの受け渡し
+    には動画に内蔵されたGPSトラック（CAMM）のみで完結し、この
+    GPXファイルは不要（implement.txt旧1733-1735行目にも同様の
+    注記があった）。ユーザーの判断で撤去することになった。
+
+  変更内容:
+    - app/gpx_handler.py: export_trimmed()メソッドを削除
+      （呼び出し元がExporter.export()のみだったため。共通ヘルパー
+      _build_output_points()はget_points_for_camm()が引き続き使う
+      ため維持）
+    - app/exporter.py:
+      - export()の戻り値をtuple[str, str]（動画・GPXパス）から
+        str（動画パスのみ）に変更。GPX出力パス生成・
+        export_trimmed()呼び出しを削除
+      - GPX出力専用だったgenerate_output_path()を削除（動画の
+        保存先は保存ダイアログの指定値をそのまま使うため、この
+        連番付与ロジックはGPX出力にしか使われていなかった）
+      - build_mapillary_tools_command()の未使用引数gpx_output_pathを
+        削除（元々コマンドテンプレート内で参照されておらず、実質
+        使われていなかった）
+    - app/main_window.py: on_export_clicked()・
+      _show_export_complete_dialog()からgpx_path関連の処理・
+      完了ダイアログの「GPX: {path}」表示を削除
+    - テスト: tests/test_gpx_handler.pyのexport_trimmedテスト、
+      tests/test_exporter.pyのgenerate_output_path関連テスト・GPX
+      書き出しアサーションを削除。関連テストの呼び出しシグネチャを
+      更新（195件→192件）
+    - spec.txt §1・§5-6: GPXファイル単体出力の記述を削除
+    - implement.txt §4-6（GPXHandler）・§4-9（Exporter）:
+      export_trimmed()関連の記述を削除
+
+  バージョン: 出力ファイルが1つ減る仕様変更のためAPP_VERSIONを
+  マイナー更新（2.1.2 → 2.2.0）。
+
 
 ================================================================
                               以上

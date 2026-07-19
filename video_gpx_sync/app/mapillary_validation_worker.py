@@ -3,13 +3,13 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from app.mapillary_validator import ValidationResult, validate_export
 
 
 class MapillaryValidationWorker(QThread):
-    finished_validation = pyqtSignal(object)  # ValidationResult | None
+    finished_validation = Signal(object)  # ValidationResult | None
 
     def __init__(
         self,

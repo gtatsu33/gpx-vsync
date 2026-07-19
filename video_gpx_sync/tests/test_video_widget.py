@@ -1,9 +1,9 @@
 import os
 
 import pytest
-from PyQt6.QtCore import QEvent, QPointF, Qt, QUrl
-from PyQt6.QtGui import QMouseEvent
-from PyQt6.QtMultimedia import QMediaPlayer
+from PySide6.QtCore import QEvent, QPointF, Qt, QUrl
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtMultimedia import QMediaPlayer
 
 from app.video_widget import CustomTimeline, VideoWidget, format_time
 

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QCheckBox, QDoubleSpinBox, QHBoxLayout, QLabel, QWidget
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import QCheckBox, QDoubleSpinBox, QHBoxLayout, QLabel, QWidget
 
 DEFAULT_INTERVAL_SEC = 0.5
 
 
 class TimelapseWidget(QWidget):
-    timelapse_changed = pyqtSignal(bool, float)
+    timelapse_changed = Signal(bool, float)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)

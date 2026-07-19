@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
 
 CHECKMARK_ICON_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

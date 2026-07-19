@@ -4,9 +4,9 @@ import datetime
 import time
 from typing import Callable
 
-from PyQt6.QtCore import QDateTime, QSettings, QUrl, Qt
-from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QDateTime, QSettings, QUrl, Qt
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import (
     QCheckBox,
     QDateTimeEdit,
     QDialog,
@@ -79,7 +79,7 @@ class MainWindow(QMainWindow):
         self._reverse_active = False
         self._reverse_last_step_time: float | None = None
 
-        self.setWindowTitle(f"Video-GPX Sync Tool v{APP_VERSION}")
+        self.setWindowTitle(f"gpx-vsync v{APP_VERSION}")
         self.resize(1280, 720)
         self.setAcceptDrops(True)
 
@@ -542,7 +542,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
 
-        local_naive = dt_edit.dateTime().toPyDateTime()
+        local_naive = dt_edit.dateTime().toPython()
         return local_naive.astimezone(datetime.timezone.utc)
 
     def _prompt_timelapse_settings(self, has_audio: bool) -> tuple[bool, float]:
@@ -865,14 +865,14 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            video_path, gpx_path = self.exporter.export(self.state, video_output_path)
+            video_path = self.exporter.export(self.state, video_output_path)
         except Exception as exc:  # noqa: BLE001 - ユーザーへの通知が目的
             QMessageBox.warning(self, "出力エラー", str(exc))
             return
 
         user_name = self._get_mapillary_user_name() or None
         command = self.exporter.build_mapillary_tools_command(
-            self.state, video_path, gpx_path, user_name=user_name
+            self.state, video_path, user_name=user_name
         )
 
         if self._is_mapillary_tools_available_impl():
@@ -889,13 +889,12 @@ class MainWindow(QMainWindow):
         can_upload = validation_result is not None and validation_result.ok
 
         self._show_export_complete_dialog(
-            video_path, gpx_path, command, validation_message, can_upload
+            video_path, command, validation_message, can_upload
         )
 
     def _show_export_complete_dialog(
         self,
         video_path: str,
-        gpx_path: str,
         command: str,
         validation_message: str,
         can_upload: bool,
@@ -908,7 +907,7 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("出力完了")
         box.setText(
             f"出力が完了しました。\n\n"
-            f"動画: {video_path}\nGPX: {gpx_path}\n\n"
+            f"動画: {video_path}\n\n"
             f"{validation_message}\n\n"
             f"Mapillaryへアップロードするには、下の「Mapillaryへ"
             f"アップロード」ボタンを押すか、以下のコマンドを"

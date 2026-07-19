@@ -3,13 +3,13 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from app.mapillary_validator import UploadResult, upload_export
 
 
 class MapillaryUploadWorker(QThread):
-    finished_upload = pyqtSignal(object)  # UploadResult | None
+    finished_upload = Signal(object)  # UploadResult | None
 
     def __init__(
         self,

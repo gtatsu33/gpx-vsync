@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 STEP_DEFINITIONS: list[tuple[float, str]] = [
     (-600.0, "-10分"),
@@ -23,7 +23,7 @@ def format_offset(seconds: float) -> str:
 
 
 class OffsetWidget(QWidget):
-    offset_changed = pyqtSignal(float)
+    offset_changed = Signal(float)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)

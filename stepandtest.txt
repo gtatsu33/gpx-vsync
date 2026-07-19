@@ -1,6 +1,6 @@
 ================================================================
-  Video-GPX Sync Tool - 実装ステップ・テスト計画
-  版数: 1.3  作成日: 2026-07-12  更新日: 2026-07-13
+  gpx-vsync - 実装ステップ・テスト計画
+  版数: 1.8  作成日: 2026-07-12  更新日: 2026-07-19
 ================================================================
 
 1. 実装方針
@@ -481,6 +481,220 @@
       マップ上のルートが全区間グレー表示になり、マーカーも動かない
       という報告を受け、実機再現の上で特定・修正した
       対応implement.txtセクション: 4-1, 23
+
+  Step 29: PySide6移行（フェーズ1：GUIフレームワーク移行、地図表示は現状維持）
+    方針: 地図表示（Leaflet.js + QWebEngineView）の中身は変更せず、
+         GUIフレームワークをPyQt6からPySide6に置き換えることのみを
+         このフェーズのスコープとする。QtLocation(OSM)への地図置き換えは
+         フェーズ2として別途実施する。
+         対象はPyQt6を直接import/使用している17ファイル
+         （app/配下14ファイル + main.py + テスト2ファイル）。
+         GPXHandler・VideoHandler・Exporter・CammEncoder・MapMatcher・
+         MapillaryValidator等のロジック層はPyQt6に依存していないため
+         本フェーズの変更対象外。
+         motivation: 将来.appとして再配布する際にQWebEngineView
+         （Chromium同梱）の肥大化を避けたい。そのための地図ネイティブ化
+         （フェーズ2）に必要な前提として、PyQt6には無いQtLocationの
+         バインディングを持つPySide6へ先に移行する。
+
+    29-1: 依存関係入れ替え
+      - requirements.txt: `PyQt6>=6.11.0` / `PyQt6-WebEngine>=6.11.0`
+        → `PySide6>=6.11.1` に変更
+      - .venv再構築（PyQt6系アンインストール → PySide6インストール）
+      対応implement.txtセクション: 12
+
+    29-2: 依存の少ないファイル群の置換
+         （theme.py, offset_widget.py, timelapse_widget.py）
+      - `from PyQt6.X import Y` → `from PySide6.X import Y`
+      - `pyqtSignal` → `Signal`（offset_widget.py, timelapse_widget.py）
+      対応implement.txtセクション: 4-5, 4-3後半（タイムラプス関連）
+
+    29-3: Worker/Dialog系の置換
+         （map_matching_worker.py, map_matching_dialog.py,
+          mapillary_upload_worker.py, mapillary_upload_dialog.py,
+          mapillary_validation_worker.py, mapillary_validation_dialog.py）
+      - import置換 + `pyqtSignal` → `Signal`
+        （QThreadサブクラスのシグナル定義部分、6ファイル）
+      対応implement.txtセクション: 9, 11
+
+    29-4: video_widget.py の置換
+      - `PyQt6.QtCore` / `PyQt6.QtMultimedia` / `PyQt6.QtMultimediaWidgets`
+        → PySide6版に置換
+      - `pyqtSignal` → `Signal`（7箇所、本ファイルが最多）
+      - QMediaPlayerのシグナル（positionChanged等）接続部分の
+        シグネチャ差異がないか個別確認
+      対応implement.txtセクション: 4-3, 4-4, 7
+
+    29-5: map_widget.py の置換（中身のLeaflet連携ロジックは変更しない）
+      - `PyQt6.QtWebEngineCore` / `PyQt6.QtWebEngineWidgets`
+        → PySide6版に置換
+      対応implement.txtセクション: 4-2, 9
+
+    29-6: main_window.py + main.py（最終統合）
+      - import置換（QSettings, QAction, QUrl等を含む）
+      - main.pyの`QCoreApplication.setAttribute(AA_ShareOpenGLContexts)`が
+        PySide6でも同一属性名・同一挙動で必要か確認
+      対応implement.txtセクション: 4-1, 5, 8
+
+    29-7: テストスイート更新
+      - tests/test_main_window.py, tests/test_video_widget.py の
+        import置換
+      - Step0〜28で作成済みの全テストをpytestで実行し、PySide6環境でも
+        グリーンになることを確認
+
+    29-8: パッケージング・起動確認
+      - `GPX-VSync.app/Contents/MacOS/GPX-VSync` 起動スクリプトが
+        新venvで問題なく動作するか確認
+      - requirements.txt最終形の確認（不要になったPyQt6-WebEngine等の
+        残存が無いか）
+
+    29-9: バージョン更新・仕様書改訂
+      - APP_VERSION: 1.1.2 → 2.0.0（メジャー。GUIフレームワーク変更の
+        破壊的変更にあたるため）
+      - Info.plist: CFBundleShortVersionString / CFBundleVersion更新
+      - implement.txt: GUIフレームワーク節（4, 11-14行目）、依存パッケージ
+        節（22, 33-34, 1716-1717行目）をPySide6ベースの記述に書き換え。
+        QtLocation不採用理由（57-59行目）は、フェーズ2実施までの間は
+        「フェーズ2でQtLocationへ移行予定」という注記に更新するのみとし、
+        地図実装セクション自体の書き換えはフェーズ2で行う
+
+    29-10: venv配置をリポジトリ直下に移設（当初計画外の追加対応）
+      背景: Step29完了後の動作確認で、ユーザーが日常的に
+      `~/Codes/gpx-vsync`（リポジトリ直下）で.venvをactivateする運用を
+      していることが判明。`video_gpx_sync/.venv`は元の配置のままだった
+      ため、ユーザーのターミナルでは`python3 main.py`実行時に
+      `ModuleNotFoundError: No module named 'PySide6'`が発生した
+      （video_gpx_sync/.venvにはインストール済みだが、ユーザーが
+      普段activateするvenvとは別物だったため）。
+      - `~/Codes/gpx-vsync/.venv`を新規作成し、
+        video_gpx_sync/requirements.txt・requirements-dev.txtの内容を
+        インストール
+      - `video_gpx_sync/.venv`（旧）は削除
+      - `GPX-VSync.app`起動スクリプトを、リポジトリ直下の.venvを
+        activateしてから video_gpx_sync に cd する形に修正
+      - `.gitignore`: `video_gpx_sync/.venv/` → `.venv/`
+      - implement.txt§12（開発・実行手順）をリポジトリ直下venv前提に更新
+      対応implement.txtセクション: 12
+
+  Step 30: QtLocation地図への置き換え（フェーズ2）
+    方針: Step29で「地図表示は変更しない」としていた部分に着手する。
+         QWebEngineView + Leaflet.js を廃し、QtLocationのOSMプラグイン
+         （QML）によるネイティブ地図に置き換える。main_window.pyが
+         MapWidgetに対して呼んでいる公開メソッドは
+         load_gpx_route() / update_route_ranges() / update_marker() /
+         hide_marker() の4つのみ（確認済み。clear()は現状未使用）。
+         この公開APIの名前・シグネチャを維持し、main_window.py側は
+         変更しない方針とする。
+         参考: doc.qt.io/qt-6 のQtLocation公式ドキュメントで
+         Plugin/Map/MapPolyline/MapQuickItem各QML型の仕様を確認済み
+         （2026-07-19）。
+
+    30-1: assets/map.qml 新規作成（最小構成）
+      - import QtQuick / QtLocation / QtPositioning
+      - Plugin{name:"osm"} + Map{}（初期中心35.0,135.0、初期ズーム13。
+        map_template.htmlの初期値を踏襲）
+      対応implement.txtセクション: 2
+
+    30-2: ルート線描画のQML実装
+      - MapPolyline + Repeater によるセグメント描画
+      - 区間内=緑(#16a34a)/区間外=グレー(#6b7280)の色分け
+        （現行map_template.htmlのsplitIntoSegments/renderRouteSegments
+        相当のロジックをQML側かPython側どちらに置くか、実装時に
+        既存API（update_route_ranges(in_range: list[bool])）との
+        整合性を見て決定する）
+      対応implement.txtセクション: 2, 4-2
+
+    30-3: 現在地マーカーのQML実装
+      - MapQuickItem（赤丸、#f03。現行updateMarker/hideMarker相当）
+      対応implement.txtセクション: 2, 4-2
+
+    30-4: app/map_widget.py 全面書き換え
+      - QWebEngineView継承 → QQuickWidget継承
+      - page().runJavaScript(...) 呼び出し → rootObject()のQML
+        function呼び出しに置き換え
+      - _pending_calls キューイング機構は、QQuickWidgetのstatus
+        （Ready判定）を起点に同様の仕組みを維持
+      - 公開メソッド名・シグネチャ・map_readyシグナルは現行のまま維持
+      対応implement.txtセクション: 2, 4-2
+
+    30-5: tests/test_map_widget.py 更新
+      - runJavaScript呼び出しのモック検証 → rootObject呼び出しの
+        モック検証に置き換え
+      - 実ページ読み込みテスト（test_real_page_load_and_leaflet_available
+        相当）をQtLocation版に置き換え
+
+    30-6: main_window.py統合の実機確認
+      - コード変更なしのはずだが、実際にGPX読み込み・オフセット調整・
+        マーカー追従が問題なく動作するか実機確認
+      対応implement.txtセクション: 5-2, 5-9
+
+    30-7: 旧ファイル・依存の整理
+      - assets/map_template.html削除
+      - Leaflet CDN関連の記述（implement.txt内）を整理
+      - requirements.txtにQtLocation関連の追加パッケージが必要か確認
+        （PySide6メタパッケージのAddonsに含まれているため追加不要の
+        見込み。Step29-9で確認済みの内容を再確認）
+
+    30-8: バージョン更新・仕様書改訂
+      - APP_VERSION: 2.0.0 → 2.1.0（マイナー。公開API・挙動は
+        変更しない内部実装の置き換えのため）
+      - Info.plist: CFBundleShortVersionString / CFBundleVersion更新
+      - implement.txt§2（マップ表示の実装方針）、map_widget.py設計節を
+        QtLocationベースの記述に書き換え
+      - spec.txtは実装非依存の記述のため変更要否を確認のみ行う
+
+    30-9: 地図の操作性（パン・ズーム）修正（当初計画外の追加対応）
+      背景: Step30完了後、ユーザーより「地図表示に対する操作（拡大縮小、
+      地図の移動）が一切効かない」と報告を受けた。調査の結果、Qt6の
+      QML Map型はLeafletと異なりデフォルトでは対話操作に対応しておらず、
+      PinchHandler/WheelHandler/DragHandlerを明示的に追加する必要が
+      あることが判明（doc.qt.io/qt-6/qml-qtlocation-map.htmlの
+      Interactivityサンプルで確認）。Step30時点ではルート線・マーカーの
+      再現に注力し、この設定が漏れていた。
+      - assets/map.qml: Map要素にPinchHandler（トラックパッドの
+        ピンチズーム・回転）・WheelHandler（マウスホイールズーム）・
+        DragHandler（ドラッグでのパン）を追加。Qt公式サンプルに準拠
+      対応implement.txtセクション: 2, 9
+
+  Step 31: GPX単体出力機能の廃止
+    方針: Exportボタンで動画とは別に自動生成されていた
+    `{元GPXファイル名}_synced.gpx`（動画の保存先と同じフォルダに
+    出力）を廃止する。動画にGPS情報を内蔵する（CAMM形式）機能が
+    できる前の「バックアップ・手動確認用」の名残で、Mapillaryへの
+    受け渡しには動画内蔵のGPSトラックのみで完結するため不要と
+    ユーザーが判断（implement.txt 25章参照）。
+
+    31-1: app/gpx_handler.py
+      - export_trimmed()メソッドを削除（呼び出し元がExporter.export()
+        のみだったため。共通ヘルパー_build_output_points()は
+        get_points_for_camm()が引き続き使うため維持）
+      対応implement.txtセクション: 4-6, 25
+
+    31-2: app/exporter.py
+      - export()の戻り値をtuple[str, str] → str（動画パスのみ）に変更
+      - GPX出力専用だったgenerate_output_path()を削除
+      - build_mapillary_tools_command()の未使用引数gpx_output_pathを
+        削除
+      対応implement.txtセクション: 4-9, 25
+
+    31-3: app/main_window.py
+      - on_export_clicked()/_show_export_complete_dialog()から
+        gpx_path関連の処理・完了ダイアログの「GPX: {path}」表示を削除
+      対応implement.txtセクション: 4-1, 25
+
+    31-4: テスト更新
+      - tests/test_gpx_handler.py: export_trimmedのテストを削除
+      - tests/test_exporter.py: generate_output_path関連テスト・GPX
+        書き出しアサーションを削除、呼び出しシグネチャを更新
+      - tests/test_main_window.py: GPXアサーション削除、
+        _show_export_complete_dialog呼び出しのシグネチャ更新
+
+    31-5: spec.txt/implement.txt/バージョン改訂
+      - spec.txt §1・§5-6: GPXファイル単体出力の記述を削除
+      - implement.txt §4-6・§4-9: export_trimmed関連の記述を削除、
+        §25として廃止の経緯を新規追記
+      - APP_VERSION: 2.1.2 → 2.2.0（マイナー。出力ファイルが1つ
+        減る仕様変更のため）
 
 
 3. テスト方針
@@ -978,6 +1192,136 @@
       （実機で発生した「マーカーが動かない」不具合の再発防止）
     （test_camm_video_creation_time_uses_embedded_epoch_not_corrupted_metadata。
     実施済み）
+
+  Step 29-1: 依存関係入れ替え
+    種別: 動作確認（手動）
+    - 新venvで `python -c "from PySide6.QtWidgets import QApplication"`
+      等の最小importが通るか
+    - 既存コードはまだPyQt6 importのままのため、この時点ではアプリ起動が
+      ImportErrorで失敗することを確認する（想定内であることの確認。
+      Step29-6完了までは起動不可の状態が続く）
+
+  Step 29-2: theme.py / offset_widget.py / timelapse_widget.py
+    種別: pytest-qt ウィジェットテスト（既存テストの再実行）
+    - offset_widget.pyの既存テスト（Step6テスト相当）がPySide6環境で
+      そのまま通るか
+    - timelapse_widget.pyの既存テスト（Step12テスト相当）が通るか
+    - theme.py適用後の見た目（配色・カードUI）に差異がないか手動確認
+
+  Step 29-3: Worker/Dialog系
+    種別: pytest-qt ウィジェットテスト（既存テストの再実行）
+    - map_matching_worker/dialog、mapillary_upload_worker/dialog、
+      mapillary_validation_worker/dialogの既存テスト
+      （Step10, Step11相当）がそのまま通るか
+    - QThread + Signal のシグナル発火・スレッド終了処理に
+      PySide6での挙動差異がないか（特にスレッド終了時のクラッシュ有無）
+
+  Step 29-4: video_widget.py
+    種別: pytest-qt ウィジェットテスト＋実機手動確認
+    - 既存のStart/Endハンドルドラッグ・一時停止固定のテスト
+      （Step5相当）が通るか
+    - 実際の動画ファイルでの再生・シーク・positionChangedの発火頻度に
+      PyQt6版（implement.txt 1350行目記載の実測値）との差異がないか
+      実機で再確認
+
+  Step 29-5: map_widget.py
+    種別: 手動確認
+    - ルート描画・マーカー更新・非表示が従来通り機能するか
+      （Step4相当のテスト再実行）
+    - runJavaScript()呼び出しがPySide6のQWebEngineViewでも
+      同様に動作するか
+
+  Step 29-6: main_window.py + main.py
+    種別: 手動確認（E2E）
+    - アプリが起動し、Step7・Step27相当の統合動作
+      （GPX/動画読み込み、UI有効化制御、出力ボタン制御等）に
+      問題ないか
+
+  Step 29-7: テストスイート全体
+    種別: pytest全体実行
+    - `pytest` で既存全テストがグリーンになることを確認
+    - MP4Box/ffmpeg依存のテストは環境にあわせてskip許容
+
+  Step 29-8: パッケージング・起動確認
+    種別: 手動確認
+    - .appをFinderからダブルクリック起動し、正常に立ち上がるか
+    - Homebrewでffmpeg/gpacを外した状態でのエラーダイアログ表示も
+      従来通りか（回帰確認）
+
+  Step 29-9: バージョン・仕様書
+    種別: レビュー確認
+    - APP_VERSIONとInfo.plistのバージョン表記がウィンドウタイトルに
+      正しく反映されているか
+    - implement.txtの該当箇所が新構成と矛盾しないか
+
+  Step 29-10: venv配置移設
+    種別: 手動確認（実施済み）
+    - リポジトリ直下.venvでのpytest全体実行（195件）
+    - `GPX-VSync.app`経由の起動でリポジトリ直下.venvのPySide6が
+      使われているか（プロセス一覧のパスで確認）
+    - ユーザー自身のターミナルで`cd video_gpx_sync && python3 main.py`
+      が正常に起動するか（ユーザー確認済み、2026-07-19）
+
+  Step 30-1: assets/map.qml（最小構成）
+    種別: 手動確認
+    - QQuickWidget等でmap.qmlを単体ロードし、OSMタイルが表示されるか
+    - 初期中心・初期ズームがmap_template.html版と一致するか
+
+  Step 30-2: ルート線描画
+    種別: 自動テスト＋手動確認
+    - 座標配列とin_rangeフラグを渡し、区間ごとに正しい色
+      （緑/グレー）でMapPolylineが生成されるか
+    - 区間の継ぎ目で線が途切れないか（現行のsplitIntoSegmentsと
+      同じ「継ぎ目に前の点を含める」仕様を踏襲できているか）
+
+  Step 30-3: 現在地マーカー
+    種別: 自動テスト＋手動確認
+    - updateMarker(lat, lon)で指定座標にマーカーが表示されるか
+    - hideMarker()で非表示になるか
+    - マーカー追従時のmap.panTo相当の挙動（現在地が常に視野内に
+      収まる自動スクロール、spec.txt 5-2節）が維持されているか
+
+  Step 30-4: app/map_widget.py全面書き換え
+    種別: pytest-qt（test_map_widget.py流用・更新）
+    - Step4/29-5で書かれた既存テスト（キューイング挙動：readyになる
+      前の呼び出しがpending_callsに積まれ、ready後にflushされるか）
+      が新実装でも同じ意味で成立するか
+
+  Step 30-5: tests/test_map_widget.py更新
+    種別: pytest実行
+    - 更新後のテスト一式がグリーンになることを確認
+
+  Step 30-6: main_window.py統合
+    種別: 手動確認（E2E）
+    - GPX読み込み→ルート線描画、オフセット調整→マーカー追従、
+      動画再生に連動したマーカー移動が違和感なく動作するか
+    - Step5-9相当（マップマッチング結果の地図反映）も確認
+
+  Step 30-7: 旧ファイル・依存の整理
+    種別: レビュー確認＋pytest全体実行
+    - map_template.html削除後もgrep等でLeaflet関連の参照が
+      残っていないか
+    - pytest全体を再実行しグリーンを確認
+
+  Step 30-8: バージョン・仕様書
+    種別: レビュー確認
+    - APP_VERSION/Info.plistの表記確認
+    - implement.txt§2・map_widget.py設計節が新実装と矛盾しないか
+
+  Step 30-9: 地図の操作性修正
+    種別: 自動テスト（QTest合成イベント）＋手動確認
+    - QTest.mousePress/mouseMove/mouseReleaseによるドラッグでMap.center
+      が変化するか（パン動作の確認）
+    - 合成QWheelEventでMap.zoomLevelが変化するか（ホイールズームの確認）
+    - 実アプリでの手動操作（マウスホイール・トラックパッドピンチ・
+      ドラッグ）でも動作すること
+
+  Step 31-1〜31-3: GPX単体出力機能の廃止
+    種別: pytest全体実行
+    - Exportボタン押下後、動画ファイルのみが生成されGPXファイルが
+      生成されないこと（test_export_creates_output_file）
+    - 完了ダイアログにGPXパスが表示されないこと
+    - 既存の全テストがグリーンのまま（192件）であること
 
 
 4. 開発用依存パッケージ

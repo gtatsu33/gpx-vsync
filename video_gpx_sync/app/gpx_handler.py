@@ -235,10 +235,10 @@ class GPXHandler:
         video_time_scale: float = 1.0,
     ) -> list[tuple[datetime.datetime, float, float, float | None]]:
         """出力用の(true_time, latitude, longitude, elevation)点列を、
-        区間境界の補間込みで構築する。export_trimmed / get_points_for_camm
-        の共通ロジック。true_time は常に実世界の絶対時刻（video_time_scale
-        適用済み）であり、動画自身の圧縮タイムライン上の位置ではない点に
-        注意（コンテナ内配置への変換はget_points_for_camm側で行う）。"""
+        区間境界の補間込みで構築する。get_points_for_camm()が使う。
+        true_time は常に実世界の絶対時刻（video_time_scale適用済み）であり、
+        動画自身の圧縮タイムライン上の位置ではない点に注意（コンテナ内配置
+        への変換はget_points_for_camm側で行う）。"""
         true_start_time = video_creation_time + datetime.timedelta(
             milliseconds=playback_ms_to_real_ms(video_start_ms, video_time_scale)
         )
@@ -277,36 +277,6 @@ class GPXHandler:
                 out.append((true_end_time, lat, lon, None))
 
         return out
-
-    def export_trimmed(
-        self,
-        output_path: str,
-        video_start_ms: int,
-        video_end_ms: int,
-        offset_sec: float,
-        video_creation_time: datetime.datetime,
-        video_time_scale: float = 1.0,
-    ) -> None:
-        built_points = self._build_output_points(
-            video_start_ms, video_end_ms, offset_sec, video_creation_time, video_time_scale
-        )
-
-        out_points = [
-            gpxpy.gpx.GPXTrackPoint(
-                latitude=lat, longitude=lon, elevation=elevation, time=t
-            )
-            for t, lat, lon, elevation in built_points
-        ]
-
-        out_gpx = gpxpy.gpx.GPX()
-        out_track = gpxpy.gpx.GPXTrack()
-        out_segment = gpxpy.gpx.GPXTrackSegment()
-        out_segment.points = out_points
-        out_track.segments.append(out_segment)
-        out_gpx.tracks.append(out_track)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(out_gpx.to_xml(version="1.1"))
 
     def replace_points(self, points: list[gpxpy.gpx.GPXTrackPoint]) -> None:
         """self.gpxを単一トラック・単一セグメントの構造に作り直し、pointsで

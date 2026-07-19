@@ -4,14 +4,14 @@ import threading
 from typing import Callable
 
 import gpxpy.gpx
-from PyQt6.QtCore import QThread, pyqtSignal
+from PySide6.QtCore import QThread, Signal
 
 from app.map_matcher import GpxMatchResult, MatchProgress, match_chunk, match_gpx_points
 
 
 class MapMatchingWorker(QThread):
-    progress = pyqtSignal(int, int)  # chunk_idx, total_chunks
-    finished_matching = pyqtSignal(object)  # GpxMatchResult
+    progress = Signal(int, int)  # chunk_idx, total_chunks
+    finished_matching = Signal(object)  # GpxMatchResult
 
     def __init__(
         self,

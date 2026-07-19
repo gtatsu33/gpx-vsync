@@ -1,8 +1,8 @@
 import shutil
 import sys
 
-from PyQt6.QtCore import Qt, QCoreApplication
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import Qt, QCoreApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 # QWebEngineView と QVideoWidget を同一ウィンドウで併用するため、
 # QApplication生成前にOpenGLコンテキスト共有を有効化しておく。

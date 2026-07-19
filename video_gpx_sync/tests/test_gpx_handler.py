@@ -1,6 +1,5 @@
 import datetime
 
-import gpxpy
 import gpxpy.gpx
 import pytest
 
@@ -215,40 +214,6 @@ def test_clip_to_gps_coverage_respects_offset(
     # -> start_ms(real) = t0 - later_creation_time + 5s = -3s + 5s = 2s = 2000ms
     assert start_ms == 2000
     assert end_ms == 6000
-
-
-def test_export_trimmed_interpolates_boundaries(
-    handler: GPXHandler, video_creation_time: datetime.datetime, tmp_path
-) -> None:
-    output_path = tmp_path / "out.gpx"
-    handler.export_trimmed(
-        str(output_path),
-        video_start_ms=1000,
-        video_end_ms=5000,
-        offset_sec=0.0,
-        video_creation_time=video_creation_time,
-    )
-
-    assert output_path.exists()
-
-    with open(output_path, "r", encoding="utf-8") as f:
-        result_gpx = gpxpy.parse(f)
-
-    assert result_gpx.version == "1.1"
-    out_points = result_gpx.tracks[0].segments[0].points
-    assert len(out_points) == 4
-
-    # 境界(Start)は補間ポイント: 01:00:00と01:00:02の中間
-    assert out_points[0].time == video_creation_time + datetime.timedelta(seconds=1)
-    assert out_points[0].latitude == pytest.approx(34.99925)
-
-    # 中間の既存ポイントがそのまま含まれる
-    assert out_points[1].latitude == pytest.approx(34.9995)
-    assert out_points[2].latitude == pytest.approx(35.0000)
-
-    # 境界(End)は補間ポイント: 01:00:04と01:00:06の中間
-    assert out_points[3].time == video_creation_time + datetime.timedelta(seconds=5)
-    assert out_points[3].latitude == pytest.approx(35.0005)
 
 
 def test_get_points_for_camm_relative_ms_and_boundaries(

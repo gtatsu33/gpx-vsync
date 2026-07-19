@@ -1,7 +1,6 @@
 import datetime
 from unittest.mock import MagicMock, patch
 
-import gpxpy
 import gpxpy.gpx
 import pytest
 
@@ -68,28 +67,6 @@ def test_can_export_false_when_state_incomplete(exporter: Exporter) -> None:
     assert exporter.can_export(AppState()) is False
 
 
-def test_generate_output_path_no_collision(exporter: Exporter, tmp_path) -> None:
-    source = tmp_path / "ride01.mp4"
-    source.write_bytes(b"x")
-    result = exporter.generate_output_path(str(tmp_path), str(source), ".mp4")
-    assert result == str(tmp_path / "ride01_synced.mp4")
-
-
-def test_generate_output_path_with_collision_gets_sequence_number(
-    exporter: Exporter, tmp_path
-) -> None:
-    source = tmp_path / "ride01.mp4"
-    source.write_bytes(b"x")
-    (tmp_path / "ride01_synced.mp4").write_bytes(b"existing")
-
-    result = exporter.generate_output_path(str(tmp_path), str(source), ".mp4")
-    assert result == str(tmp_path / "ride01_synced_2.mp4")
-
-    (tmp_path / "ride01_synced_2.mp4").write_bytes(b"existing2")
-    result2 = exporter.generate_output_path(str(tmp_path), str(source), ".mp4")
-    assert result2 == str(tmp_path / "ride01_synced_3.mp4")
-
-
 def test_default_video_filename(exporter: Exporter, base_state: AppState) -> None:
     assert exporter.default_video_filename(base_state) == "ride01_synced.mp4"
 
@@ -102,7 +79,7 @@ def test_export_raises_when_cannot_export(
         exporter.export(base_state, str(tmp_path / "out.mp4"))
 
 
-def test_export_calls_video_handler_and_embeds_camm_and_writes_gpx(
+def test_export_calls_video_handler_and_embeds_camm(
     exporter: Exporter, base_state: AppState, tmp_path
 ) -> None:
     output_dir = tmp_path / "out"
@@ -110,14 +87,10 @@ def test_export_calls_video_handler_and_embeds_camm_and_writes_gpx(
     video_output_path_arg = str(output_dir / "my_custom_name.mp4")
 
     with patch("app.exporter.embed_gps_track") as mock_embed:
-        video_output_path, gpx_output_path = exporter.export(
-            base_state, video_output_path_arg
-        )
+        video_output_path = exporter.export(base_state, video_output_path_arg)
 
     # 動画側は保存ダイアログで指定されたパスをそのまま使う（連番付与なし）
     assert video_output_path == video_output_path_arg
-    # GPX側は従来通りgpx_pathベースで自動生成される
-    assert gpx_output_path == str(output_dir / "ride01_synced.gpx")
 
     # VideoHandler.export_trimmed は一時パスにSmart Cut出力を書き出す
     exporter.video_handler.export_trimmed.assert_called_once()
@@ -134,15 +107,11 @@ def test_export_calls_video_handler_and_embeds_camm_and_writes_gpx(
     camm_points = embed_call.args[2]
     assert len(camm_points) > 0
 
-    with open(gpx_output_path, "r", encoding="utf-8") as f:
-        result_gpx = gpxpy.parse(f)
-    assert len(result_gpx.tracks[0].segments[0].points) > 0
-
 
 def test_build_mapillary_tools_command(
     exporter: Exporter, base_state: AppState
 ) -> None:
-    cmd = exporter.build_mapillary_tools_command(base_state, "out.mp4", "out.gpx")
+    cmd = exporter.build_mapillary_tools_command(base_state, "out.mp4")
     assert "mapillary_tools video_process_and_upload out.mp4" in cmd
     assert "--geotag_source exif" in cmd
     assert "--geotag_source_path" not in cmd
@@ -158,7 +127,7 @@ def test_build_mapillary_tools_command_includes_user_name_when_given(
     exporter: Exporter, base_state: AppState
 ) -> None:
     cmd = exporter.build_mapillary_tools_command(
-        base_state, "out.mp4", "out.gpx", user_name="alice"
+        base_state, "out.mp4", user_name="alice"
     )
     assert "--user_name alice" in cmd
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QPointF, QRect, QTimer, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtCore import QPointF, QRect, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 MIN_GAP_MS = 100
 HANDLE_HIT_RADIUS_PX = 10
@@ -29,9 +29,9 @@ def format_time(ms: int) -> str:
 
 
 class CustomTimeline(QWidget):
-    start_changed = pyqtSignal(int)
-    end_changed = pyqtSignal(int)
-    seek_requested = pyqtSignal(int)
+    start_changed = Signal(int)
+    end_changed = Signal(int)
+    seek_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -223,9 +223,9 @@ class CustomTimeline(QWidget):
 
 
 class VideoWidget(QWidget):
-    position_changed = pyqtSignal(int)
-    duration_changed = pyqtSignal(int)
-    seek_settled = pyqtSignal()
+    position_changed = Signal(int)
+    duration_changed = Signal(int)
+    seek_settled = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)

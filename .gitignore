@@ -1,5 +1,5 @@
 .DS_Store
-video_gpx_sync/.venv/
+.venv/
 **/__pycache__/
 *.pyc
 video_gpx_sync/.pytest_cache/

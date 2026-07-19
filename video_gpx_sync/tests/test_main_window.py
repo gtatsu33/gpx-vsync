@@ -3,8 +3,8 @@ import os
 import shutil
 
 import pytest
-from PyQt6.QtCore import QSettings, QUrl
-from PyQt6.QtWidgets import QCheckBox, QDialog, QDoubleSpinBox, QLabel, QMessageBox
+from PySide6.QtCore import QSettings, QUrl
+from PySide6.QtWidgets import QCheckBox, QDialog, QDoubleSpinBox, QLabel, QMessageBox
 
 from app.camm_encoder import embed_gps_track
 from app.main_window import MainWindow
@@ -359,7 +359,7 @@ def test_offset_change_updates_state_and_marker(
         window.load_video(SAMPLE_MP4)
 
     calls = []
-    # 実ページ(Leaflet)のロード完了タイミングに依存しないよう、
+    # 実際のQML地図のロード完了タイミングに依存しないよう、
     # MapWidgetのPythonメソッド自体をモック化して呼び出しのみ検証する。
     monkeypatch.setattr(
         window.map_widget, "update_marker", lambda lat, lon: calls.append("update")
@@ -548,7 +548,7 @@ def test_export_confirm_not_shown_when_gps_fully_covers_range(
 def test_export_confirm_crops_start_when_accepted(
     window: MainWindow, qtbot, monkeypatch
 ) -> None:
-    from PyQt6.QtWidgets import QMessageBox
+    from PySide6.QtWidgets import QMessageBox
 
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
@@ -571,7 +571,7 @@ def test_export_confirm_crops_start_when_accepted(
 def test_export_confirm_cancelled_leaves_state_unchanged(
     window: MainWindow, qtbot, monkeypatch
 ) -> None:
-    from PyQt6.QtWidgets import QMessageBox
+    from PySide6.QtWidgets import QMessageBox
 
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
@@ -589,7 +589,7 @@ def test_export_confirm_cancelled_leaves_state_unchanged(
     assert window.state.video_end_ms == 10000
 
 
-def test_export_creates_output_files(window: MainWindow, qtbot, tmp_path) -> None:
+def test_export_creates_output_file(window: MainWindow, qtbot, tmp_path) -> None:
     window.load_gpx(SAMPLE_GPX)
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
         window.load_video(SAMPLE_MP4)
@@ -597,10 +597,9 @@ def test_export_creates_output_files(window: MainWindow, qtbot, tmp_path) -> Non
     assert window.export_button.isEnabled() is True
 
     video_output_path = str(tmp_path / window.exporter.default_video_filename(window.state))
-    video_path, gpx_path = window.exporter.export(window.state, video_output_path)
+    video_path = window.exporter.export(window.state, video_output_path)
 
     assert os.path.exists(video_path)
-    assert os.path.exists(gpx_path)
 
 
 def test_reloading_own_exported_synced_video_resets_stale_offset(
@@ -619,7 +618,7 @@ def test_reloading_own_exported_synced_video_resets_stale_offset(
     assert window.state.offset_seconds == 2.0
 
     video_output_path = str(tmp_path / window.exporter.default_video_filename(window.state))
-    video_path, _gpx_path = window.exporter.export(window.state, video_output_path)
+    video_path = window.exporter.export(window.state, video_output_path)
 
     with qtbot.waitSignal(window.video_widget.duration_changed, timeout=10000):
         window.load_video(video_path)
@@ -786,14 +785,10 @@ def test_export_complete_dialog_upload_button_enabled_state(
 
     monkeypatch.setattr(QMessageBox, "exec", fake_exec)
 
-    window._show_export_complete_dialog(
-        "v.mp4", "g.gpx", "cmd", "msg", can_upload=False
-    )
+    window._show_export_complete_dialog("v.mp4", "cmd", "msg", can_upload=False)
     assert captured["enabled"] is False
 
-    window._show_export_complete_dialog(
-        "v.mp4", "g.gpx", "cmd", "msg", can_upload=True
-    )
+    window._show_export_complete_dialog("v.mp4", "cmd", "msg", can_upload=True)
     assert captured["enabled"] is True
 
 
@@ -814,9 +809,7 @@ def test_export_complete_dialog_clicking_upload_starts_upload_flow(
         window, "_start_mapillary_upload", lambda video_path: called.append(video_path)
     )
 
-    window._show_export_complete_dialog(
-        "v.mp4", "g.gpx", "cmd", "msg", can_upload=True
-    )
+    window._show_export_complete_dialog("v.mp4", "cmd", "msg", can_upload=True)
     assert called == ["v.mp4"]
 
 
