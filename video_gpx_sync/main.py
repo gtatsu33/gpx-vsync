@@ -1,8 +1,12 @@
+import os
 import shutil
 import sys
 
 from PySide6.QtCore import Qt, QCoreApplication
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
+
+APP_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "app_icon.png")
 
 # QWebEngineView と QVideoWidget を同一ウィンドウで併用するため、
 # QApplication生成前にOpenGLコンテキスト共有を有効化しておく。
@@ -44,6 +48,7 @@ def show_mp4box_missing_dialog() -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(APP_ICON_PATH))
     apply_theme(app)
 
     if not check_ffmpeg_available():

@@ -2856,6 +2856,84 @@
   マイナー更新（2.1.2 → 2.2.0）。
 
 
+--- Windows向け再配布パッケージング機能の追加 ---
+
+  背景: pythonアプリのままでは配布できないため、Windows向けに
+  ffmpeg/MP4Box(GPAC)を同梱した単体配布パッケージを作れるようにした。
+  アプリ本体(app/, main.py)のコードは一切変更していない。
+
+  追加ファイル（すべてビルド専用、パッケージング層）:
+    - video_gpx_sync/packaging/windows/video_gpx_sync.spec:
+      PyInstaller定義（onedir構成）。resources/win/bin/配下の
+      バイナリとassets/を同梱する
+    - video_gpx_sync/packaging/windows/runtime_hook.py:
+      起動直後にバンドル内binフォルダをPATH先頭に追加する
+      PyInstaller runtime hook。main.py/app/video_handler.py等が
+      使うshutil.which("ffmpeg")やsubprocess.run(["ffmpeg",...])が
+      同梱バイナリを解決できるようにするための仕組み
+    - video_gpx_sync/packaging/windows/build_windows.py:
+      ffmpeg(gyan.dev essentials)・GPACインストーラ(gpac.io、
+      URLは--gpac-url引数で都度指定)をダウンロードし、7-Zipで
+      GPACインストーラを展開してMP4Box.exe+依存DLLを抽出、
+      resources/win/bin/に配置した上でPyInstallerを実行し、
+      dist/gpx-vsync-win-x64-v{APP_VERSION}.zipを生成する
+    - requirements-dev.txt: pyinstallerを追加
+    - .gitignore: video_gpx_sync/.build_cache/, build/, dist/,
+      resources/win/bin/ を追加（ダウンロードした外部バイナリ・
+      ビルド成果物はリポジトリに含めない）
+
+  同梱バイナリのライセンス: FFmpeg(LGPL/GPL)・GPAC/MP4Box(GPL)を
+  再配布するため、配布zip内にTHIRD_PARTY_LICENSES.txtを同梱する
+  （build_windows.pyが自動生成）。
+
+  前提条件: 7-Zip（7zコマンド）がビルド環境にインストール済みであること。
+
+  macOS向けパッケージングは別途対応予定（本変更のスコープ外）。
+
+  動作確認（実機ビルド・起動）:
+    - build_windows.pyの--gpac-url必須チェックが--skip-download指定時にも
+      働いてしまうバグを修正
+    - 初回ビルドでは動画再生は問題ないがマップが表示されない不具合を発見。
+      原因はQtLocationのPlugin{name: "osm"}が実行時に文字列名で動的ロード
+      されるため、PyInstallerの自動解析がqtgeoservices_osm.dllを検出できず
+      未同梱だったこと。video_gpx_sync.spec内でPySide6の
+      plugins/geoservices/*.dllを明示的にdatasへ追加して解決（アプリ
+      コードは無変更）
+    - 再ビルド後、動画再生・地図表示ともに実機で確認済み
+
+  バージョン: 新機能追加のためAPP_VERSIONをマイナー更新
+  （2.2.0 → 2.3.0）。
+
+
+--- アプリアイコンの設定 ---
+
+  ルートに配置済みだったgpx-vsync_180x180.png / 192x192.png / 512x512.pngを
+  実際にアプリへ適用した。
+
+  変更内容:
+    - video_gpx_sync/assets/app_icon.png: gpx-vsync_512x512.pngをコピーして
+      配置（アプリが参照するアイコン画像）
+    - video_gpx_sync/main.py: QApplication生成直後に
+      app.setWindowIcon(QIcon(APP_ICON_PATH))を追加。PySide6標準機能の
+      ためMac/Windows共通で有効
+    - video_gpx_sync/packaging/windows/build_windows.py:
+      build_icon()を追加。ビルド時にgpx-vsync_512x512.pngから
+      packaging/windows/icon.ico（16/32/48/64/128/256pxのマルチサイズ）を
+      生成するようにした（Windows専用、exeファイル自体のアイコン用）
+    - video_gpx_sync/packaging/windows/video_gpx_sync.spec:
+      EXE(icon=...)でicon.icoを指定
+    - requirements-dev.txt: Pillowを追加（ico生成に使用）
+    - .gitignore: 生成物であるpackaging/windows/icon.icoを追加
+
+  実機ビルドで、ウィンドウ/タスクバーアイコンとexeファイルアイコンの
+  両方が反映されることを確認済み。
+
+  macOS向けの.icns/Info.plist設定は別途対応予定（本変更のスコープ外）。
+
+  バージョン: 細かい調整のためAPP_VERSIONをパッチ更新
+  （2.3.0 → 2.3.1）。
+
+
 ================================================================
                               以上
 ================================================================

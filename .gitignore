@@ -4,3 +4,8 @@
 *.pyc
 video_gpx_sync/.pytest_cache/
 video_gpx_sync/GPX-VSync.app/
+video_gpx_sync/.build_cache/
+video_gpx_sync/build/
+video_gpx_sync/dist/
+video_gpx_sync/resources/win/bin/
+video_gpx_sync/packaging/windows/icon.ico
