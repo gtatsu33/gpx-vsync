@@ -2934,6 +2934,94 @@
   （2.3.0 → 2.3.1）。
 
 
+--- macOS向け再配布パッケージング機能の追加 ---
+
+  背景: Windows版（上記）と同様、macOS向けにもffmpeg/MP4Box(GPAC)を
+  同梱した単体配布パッケージ（.app）を作れるようにした。アプリ本体
+  (app/, main.py)のコードは一切変更していない。
+
+  追加ファイル（すべてビルド専用、パッケージング層）:
+    - video_gpx_sync/packaging/mac/video_gpx_sync.spec:
+      PyInstaller定義（onedir + BUNDLE()で.app化）。
+      resources/mac/bin/配下のバイナリとassets/を同梱する。
+      BUNDLE()のversion/CFBundleShortVersionString/CFBundleVersionには
+      app.APP_VERSIONを渡し、Info.plistに反映する
+    - video_gpx_sync/packaging/mac/runtime_hook.py:
+      Windows版と同じロジック（起動直後にバンドル内binフォルダを
+      PATH先頭に追加）のmac版。sys._MEIPASSはmacOSのonedir .app
+      バンドルでは Contents/Frameworks を指す（Contents/Resourcesには
+      Contents/Frameworksへのシンボリックリンクが張られる、
+      PyInstallerのmacOS向けコード署名対応の仕組み）ことを実機で
+      確認済み
+    - video_gpx_sync/packaging/mac/build_mac.py:
+      ffmpeg/ffprobe（evermeet.cxの静的ビルド、x86_64）をダウンロード、
+      GPACインストーラ(.pkg、gpac.io、URLは--gpac-url引数で都度指定)を
+      ダウンロードしてpkgutil --expand-fullで展開（追加ツール不要）、
+      MP4Box+依存dylib一式をresources/mac/bin/に配置した上でPyInstaller
+      を実行し、.appにアドホックコード署名(codesign --deep -s -)を
+      行った上でdist/gpx-vsync-mac-v{APP_VERSION}.zipを生成する
+    - requirements-dev.txt: 追加パッケージなし（既存のpyinstaller/
+      Pillowをそのまま流用。.icns生成もPillowのImage.save()で
+      可能なことを確認済み）
+    - .gitignore: video_gpx_sync/resources/mac/bin/,
+      video_gpx_sync/packaging/mac/icon.icns を追加
+      （.build_cache/, build/, dist/は既存のWindows版設定を共用）
+
+  アーキテクチャに関する制約（重要）:
+    ffmpeg/ffprobe（evermeet.cx）・MP4Box(GPAC公式pkg)とも、2026-07-20
+    時点でmacOS公式配布はx86_64ビルドのみで、Apple Siliconネイティブ
+    (arm64)版が提供されていない（evermeet.cxは提供しない方針を明言）。
+    そのためApple Silicon Mac上ではこれら同梱ツールはRosetta 2経由で
+    動作する（Rosetta未インストール環境では初回実行時にmacOSが自動で
+    インストールを促す）。アプリ本体(Python/PySide6)はビルドを実行した
+    Macのアーキテクチャでネイティブビルドされる（このMac=arm64では
+    実機ビルドでtype="Foreground" Arch=ARM64を確認済み）。
+    Homebrew経由のarm64ネイティブ版から依存dylibを再配置する代替案も
+    検討したが、dylibの相互依存（GPAC公式pkgで約94個）を
+    install_name_toolで書き換える必要があり壊れやすいため、Windows版
+    同様「公式配布バイナリをそのまま使う」方針を優先した。
+
+  コード署名について:
+    ダウンロードした外部バイナリ（ffmpeg/ffprobe/MP4Box/依存dylib）は
+    すべて無署名だった（codesign -dvで確認済み）。Apple Siliconでは
+    無署名バイナリを実行できないため、build_mac.pyの最終工程で.app
+    全体にアドホックコード署名(codesign --force --deep --sign -)を
+    行う。Apple Developer IDでの正式署名・公証(notarize)は行っていない
+    ため、配布物をダウンロードしたユーザーは初回起動時にGatekeeperの
+    警告が出る。zip内に同梱するREADME_macOS.txtでFinderからの
+    右クリック→「開く」による回避方法とRosetta 2の説明を案内する
+
+  QtLocationのOSMプラグインについて:
+    Windows版と同じ理由（Plugin{name: "osm"}が実行時に文字列名で
+    動的ロードされるためPyInstallerの自動解析で検出されない）で
+    明示的にdatasへ追加。macOS版PySide6 wheelはWindows版と異なり
+    `PySide6/Qt/plugins/geoservices/`配下にプラグインを持つ点に注意
+    （Windows版は`PySide6/plugins/geoservices/`）
+
+  配布パッケージ形式: Windows版と同じzip形式を採用（.appフォルダを
+  そのままditto → zip化。dmgは不採用、ユーザーとの相談の結果）
+
+  動作確認（実機ビルド・起動）:
+    - resources/mac/bin/配下に配置したMP4Box/dylibがPyInstallerの
+      Analysisで自動的にMach-Oバイナリと認識され、指定したdatas上の
+      相対パス(bin/lib/配下)を保ったままContents/Frameworks/配下へ
+      再配置されることを確認（Contents/Resources側には互換用の
+      シンボリックリンクが自動生成される）
+    - 同梱ffmpeg/ffprobe/MP4Boxを直接実行し、バージョン情報の取得・
+      実ファイル（CAMM埋め込み済みmp4）への-info実行が正常に動作
+      することを確認（MP4Boxの「モジュールディレクトリが見つからない」
+      という警告は、GPAC本体のプレイヤー用出力モジュール
+      (share/gui等、未同梱)に関するものでexit code 0、MP4Boxの
+      ファイル操作自体には影響しないことを確認）
+    - ビルドした.appを起動し、プロセスが安定して稼働しフォアグラウンド
+      アプリとして認識されること（lsappinfo list で
+      type="Foreground" Arch=ARM64 Version="2.4.0"）、クラッシュ
+      レポートが生成されないことを確認済み
+
+  バージョン: 新機能追加のためAPP_VERSIONをマイナー更新
+  （2.3.1 → 2.4.0）。
+
+
 ================================================================
                               以上
 ================================================================

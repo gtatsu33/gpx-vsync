@@ -9,3 +9,5 @@ video_gpx_sync/build/
 video_gpx_sync/dist/
 video_gpx_sync/resources/win/bin/
 video_gpx_sync/packaging/windows/icon.ico
+video_gpx_sync/resources/mac/bin/
+video_gpx_sync/packaging/mac/icon.icns
