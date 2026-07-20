@@ -237,12 +237,15 @@ def test_seek_clamps_to_start_end_range(video_widget: VideoWidget, qtbot) -> Non
     video_widget.timeline.set_end(6000)
 
     video_widget.seek(500)  # start(2000)より前 -> クランプされる
-    assert video_widget.player.position() == 2000
 
     # seek()は直前のシークの映像フレーム描画完了を待ってから次のシークを
     # 発行する（連投すると1枚も描画完了しないまま次に上書きされる不具合
-    # への対処、2026-07-18）。そのため次のseek()の前に完了を待つ。
+    # への対処、2026-07-18）。position()への反映も非同期のため、
+    # assertの前にもseek_settledを待つ必要がある（darwinバックエンドで
+    # position()の反映がffmpegバックエンドより遅れることを実機確認済み、
+    # 2026-07-20）。
     qtbot.waitSignal(video_widget.seek_settled, timeout=2000).wait()
+    assert video_widget.player.position() == 2000
 
     video_widget.seek(9000)  # end(6000)より後 -> クランプされる
     assert video_widget.player.position() == 6000

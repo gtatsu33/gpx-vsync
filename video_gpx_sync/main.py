@@ -2,6 +2,14 @@ import os
 import shutil
 import sys
 
+# QtMultimediaのデフォルト(ffmpeg)バックエンドはmacOSで1シークあたり約300ms
+# かかり操作感が重いことを実測で確認したため、macOSではネイティブの
+# darwinバックエンド(AVFoundation)に切り替える（実測で約4倍高速化、
+# 約70ms/シーク）。QMediaPlayer等の初回使用より前に設定する必要が
+# あるため、Qtのインポートより前に行う。Windows/Linuxは変更しない。
+if sys.platform == "darwin":
+    os.environ.setdefault("QT_MEDIA_BACKEND", "darwin")
+
 from PySide6.QtCore import Qt, QCoreApplication
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox

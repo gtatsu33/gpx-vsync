@@ -11,6 +11,7 @@ HANDLE_HIT_RADIUS_PX = 10
 BAR_MARGIN_PX = 12
 BAR_HEIGHT_PX = 10
 SEEK_FRAME_TIMEOUT_MS = 400
+SEEK_FRAME_TOLERANCE_MS = 200
 BAR_TOP_OFFSET_PX = 32
 
 BAR_BG_COLOR = QColor(225, 225, 228)
@@ -245,9 +246,12 @@ class VideoWidget(QWidget):
 
         self._seek_in_flight = False
         self._pending_seek_ms: int | None = None
+        self._seek_target_ms: int | None = None
+        self._seek_retry_used = False
+        self._play_after_seek = False
         self._seek_timeout_timer = QTimer(self)
         self._seek_timeout_timer.setSingleShot(True)
-        self._seek_timeout_timer.timeout.connect(self._on_seek_frame_ready)
+        self._seek_timeout_timer.timeout.connect(self._on_seek_timeout)
         self.player.videoSink().videoFrameChanged.connect(self._on_seek_frame_ready)
 
         self.player.positionChanged.connect(self._on_position_changed)
@@ -273,8 +277,10 @@ class VideoWidget(QWidget):
         start_ms = self.timeline.start_ms()
         end_ms = self.timeline.end_ms()
         if position < start_ms or position >= end_ms:
-            self.player.setPosition(start_ms)
-        self.player.play()
+            self._play_after_seek = True
+            self._request_seek(start_ms)
+        else:
+            self.player.play()
 
     def pause(self) -> None:
         self.player.pause()
@@ -301,24 +307,61 @@ class VideoWidget(QWidget):
         target = self._pending_seek_ms
         self._pending_seek_ms = None
         self._seek_in_flight = True
+        self._seek_target_ms = target
+        self._seek_retry_used = False
         self.player.setPosition(target)
         self._seek_timeout_timer.start(SEEK_FRAME_TIMEOUT_MS)
 
-    def _on_seek_frame_ready(self, *_args: object) -> None:
+    def _on_seek_frame_ready(self, *args: object) -> None:
+        """videoFrameChanged経由で呼ばれた場合、load()の初回プライミング
+        （play()→pause()→setPosition(0)）が非同期に完了させるフレームなど、
+        自分が発行したシーク以外のフレームが先に届くことがある
+        （darwinバックエンドで実機確認済み、2026-07-20）。フレームの
+        タイムスタンプがシーク目標から大きく外れている場合は無視し、
+        タイムアウトタイマー（フォールバック）に委ねる。"""
         if not self._seek_in_flight:
             return
+        if args:
+            frame = args[0]
+            frame_ms = frame.startTime() // 1000
+            if abs(frame_ms - self._seek_target_ms) > SEEK_FRAME_TOLERANCE_MS:
+                return
+        self._finish_seek()
+
+    def _on_seek_timeout(self) -> None:
+        """タイムアウト発火時点でplayer.position()が目標から大きく
+        外れている場合、シーク要求が他の要因（例: 呼び出し元が
+        player.setPosition()を直接叩くなど本来のパス外からの操作）で
+        上書きされ、目標フレームが届かなかった可能性がある。一度だけ
+        シークを再発行して回復を試みる（無限リトライは行わない）。"""
+        if not self._seek_in_flight:
+            return
+        if (
+            not self._seek_retry_used
+            and abs(self.player.position() - self._seek_target_ms) > SEEK_FRAME_TOLERANCE_MS
+        ):
+            self._seek_retry_used = True
+            self.player.setPosition(self._seek_target_ms)
+            self._seek_timeout_timer.start(SEEK_FRAME_TIMEOUT_MS)
+            return
+        self._finish_seek()
+
+    def _finish_seek(self) -> None:
         self._seek_timeout_timer.stop()
         self._seek_in_flight = False
         if self._pending_seek_ms is not None:
             self._start_next_paced_seek()
         else:
+            if self._play_after_seek:
+                self._play_after_seek = False
+                self.player.play()
             self.seek_settled.emit()
 
     def _on_position_changed(self, ms: int) -> None:
         end_ms = self.timeline.end_ms()
         if ms >= end_ms:
             if ms != end_ms:
-                self.player.setPosition(end_ms)
+                self._request_seek(end_ms)
             self.player.pause()
             ms = end_ms
         self.timeline.set_position(ms)

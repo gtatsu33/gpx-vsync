@@ -3022,6 +3022,86 @@
   （2.3.1 → 2.4.0）。
 
 
+--- macOSでの動画シーク遅延の改善 ---
+
+  背景: ユーザーより「Windowsに比べてMacの方がシークバー操作への
+  反応が圧倒的に遅い・重い」との報告を受け、原因調査を行った。
+
+  調査結果:
+    PySide6(Qt6)のQtMultimediaは現在、Windows/macOS問わずデフォルトで
+    同梱のFFmpegベースのクロスプラットフォームバックエンド(ffmpeg)を
+    使う仕様になっている。実機の4K動画（実際のサンプルファイル、
+    H.264 High profile, ~59Mbps, キーフレーム間隔約1.2秒）で
+    QMediaPlayer単体のシーク遅延を計測したところ、デフォルトの
+    ffmpegバックエンドでは平均約300ms/シークかかっていた
+    （VideoToolboxハードウェアデコードを環境変数
+    QT_FFMPEG_DECODING_HW_DEVICE_TYPES=videotoolboxで明示指定しても
+    改善せず、Qt側のffmpegバックエンド実装自体のオーバーヘッドと
+    判断）。一方、macOS向けのネイティブバックエンド darwin
+    （AVFoundation直結、Qt公式がQT_MEDIA_BACKEND環境変数で提供する
+    切替オプション。非推奨ではないが「限定的サポート」）に切り替えた
+    ところ、同一条件で平均約70〜71ms/シークとなり、約4倍高速化した。
+    Windows側は体感良好とのことなので変更していない。
+
+  変更内容:
+    - video_gpx_sync/main.py: QApplication生成前（Qtのインポートより
+      前）に、sys.platform == "darwin"の場合のみ
+      os.environ.setdefault("QT_MEDIA_BACKEND", "darwin")を設定。
+      Windows/Linuxの挙動には影響しない
+
+  追加で判明した問題と対応（darwinバックエンド固有）:
+    darwinバックエンドに切り替えた状態で既存テストを実行したところ、
+    以下2件が間欠的に失敗することが判明した。原因はいずれも
+    「シーク要求からの完了通知（videoFrameChanged / position()の
+    反映）が、ffmpegバックエンドより非同期性が強い」ことに起因する。
+
+    1. app/video_widget.py の play():
+       再生位置がStart範囲より前にある場合の「Startへジャンプしてから
+       再生」処理が、player.setPosition()を直接呼んでいたため、
+       既存のペーシング機構(_request_seek())による連投防止の対象外
+       だった。darwinバックエンドでは、シークが完了しないうちに
+       play()を呼ぶと、シーク先を無視してその場（またはシーク前の
+       位置）から再生を始めてしまう不具合を実機確認した
+       （test_play_from_outside_range_jumps_to_startが間欠的に失敗）。
+       対応: play()の直接呼び出しを_request_seek()経由に統一し、
+       _play_after_seekフラグを追加。シークが本当に完了する
+       （_finish_seek()に到達する）まで player.play() の呼び出しを
+       遅延するよう変更した。_on_position_changed()のEnd到達時の
+       クランプ処理も同様に統一した
+
+    2. _on_seek_frame_ready()（videoSink().videoFrameChangedに接続）:
+       load()の初回プライミング（play()→pause()→setPosition(0)）が
+       非同期に発生させるフレームなど、直前の無関係な操作による
+       フレームが、進行中のシークの「完了通知」と誤認されることが
+       darwinバックエンドで実機確認された。対応: 受信したフレームの
+       startTime()（マイクロ秒）をシーク目標値と比較し、
+       SEEK_FRAME_TOLERANCE_MS（200ms）を超えて乖離している場合は
+       無視し、タイムアウトタイマーによるフォールバックに委ねるよう
+       変更。さらに、タイムアウト発火時点でplayer.position()が
+       目標から乖離している場合（何らかの理由でシーク要求が上書き
+       されたケース）に一度だけシークを再発行するリトライ処理
+       (_on_seek_timeout())を追加した
+
+    3. tests/test_video_widget.py の
+       test_seek_clamps_to_start_end_range:
+       seek()呼び出し直後、seek_settledシグナルを待たずに
+       player.position()を同期的にassertしていた。ffmpegバックエンド
+       ではsetPosition()呼び出し直後からposition()が楽観的に新しい
+       値を返すため問題化しなかったが、darwinバックエンドではこの
+       反映に遅延があり間欠的に失敗した。qtbot.waitSignal(seek_settled)
+       をassertの前に追加して対応（上記1のバグ修正ではなく、テスト側の
+       タイミング前提の是正）
+
+    修正後、darwin/ffmpeg両バックエンドで全192件のテストを複数回
+    （各5回以上）連続実行し、いずれも安定してパスすることを確認済み。
+    また実機で、修正後もdarwinバックエンドのシーク遅延が改善前の
+    ffmpegバックエンドと同等（約70ms/シーク、実サンプル動画）で
+    あることを再確認した。
+
+  バージョン: バグ修正・安定性改善のためAPP_VERSIONをパッチ更新
+  （2.4.0 → 2.4.1）。
+
+
 ================================================================
                               以上
 ================================================================
